@@ -1,0 +1,71 @@
+#cloud-config
+hostname: k8s-node-1
+timezone: America/Los_Angeles
+users:
+  - name: k8s_80
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDC5PcI8sHqG8w7K9UM68bOIC26Ie/J/xHm5Wr+3lpAGI8K3qzd0rzEUlJ2F34BuULKN+yW+R1ElXvAO/9yJTZjFH8YwVNSh5cYi07/NJ7j4wVQyzdif6z0s4WkLvpHni00OlISc/ul8CIFAhAVeXrXJVYhp85tZEsE7lQpmV2zr4dAaqLUWJap7QM63Mrypr+PasJS1uaB8+4yqOsmVm/xLsgrTZ/+HqPb1BQzAtL054Jp1K1YUsjukFQV7AgSav/3CHEeYxDiKxI0d1lllQDPKWEvLExToqZCDUarATjBw8OX+3NPRoal9O5Weux9Cx/ISIf3OXexMdy2fLhpCjOM6ppyanCecA4kSS+vgIGMXv8euAE+PTlmxPS4vLT2WPjxVR0O/6myDuZrFu3dwmFiyAeGtbN2E4tdiQ5vQXKAg1FYgt1fRMXYtkiFa3/jhROd36Hpem8A9L3t/3y2ZUwqZLPzjgYnVvcgHQNKkqou3cq/m13qtdOj7Fh6TSrbElBjrNvR8iFDquLjaQX5pyQvw93llk0C8CpUGK9TkAgHV42CxkERDQ1D/sDoFgV3zmSTY049JrZAohDBWSqbujNRdWc5R9h9cM9Kvk7xchUdA6FKpr7GnyrIGexEgVHvkveBC71o9xzT6XhEANkDIOWTJyWcrd7Ebiu4fo90tphB4w== k8s_pi key
+    groups: [sudo, docker, sys]
+    shell: /bin/bash
+chpasswd:
+  expire: false
+ssh_pwauth: false
+disable_root: true
+packages:
+  - docker.io
+  - python3-pip
+  - python3-venv
+  - python3-dev
+  - libffi-dev
+  - libssl-dev
+  - git
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - software-properties-common
+  - kubelet
+  - kubeadm
+  - kubectl
+write_files:
+  - path: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    content: |
+      network: {config: disabled}
+  - path: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+  - path: /etc/sysctl.d/k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward = 1
+runcmd:
+  # Set up Kubernetes repository
+  - curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+  - echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" > /etc/apt/sources.list.d/kubernetes.list
+  - apt-get update
+  
+  # Configure containerd
+  - mkdir -p /etc/containerd
+  - containerd config default > /etc/containerd/config.toml
+  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+  - systemctl restart containerd
+  
+  # Load kernel modules required by Kubernetes
+  - modprobe overlay
+  - modprobe br_netfilter
+  
+  # Apply sysctl params
+  - sysctl --system
+  
+  # Disable swap
+  - swapoff -a
+  - sed -i '/swap/d' /etc/fstab
+  
+  # Hold Kubernetes packages version
+  - apt-mark hold kubelet kubeadm kubectl
+  
+  # Enable and start services
+  - systemctl enable kubelet
+  - systemctl enable ssh
+  - systemctl restart ssh
