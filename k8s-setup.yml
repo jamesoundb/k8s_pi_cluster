@@ -1,0 +1,167 @@
+---
+- name: Kubernetes Cluster Setup
+  hosts: k8s_nodes
+  become: yes
+  vars:
+    k8s_version: "1.29"
+    k8s_username: "{{ ansible_user }}"
+  
+  tasks:
+    - name: Wait for apt locks to be released
+      shell: |
+        while lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || lsof /var/lib/apt/lists/lock >/dev/null 2>&1 || lsof /var/cache/apt/archives/lock >/dev/null 2>&1 || lsof /var/lib/dpkg/lock >/dev/null 2>&1; do
+          echo "Waiting for apt lock to be released..."
+          sleep 5
+        done
+      changed_when: false
+      
+    - name: Fix all corrupted dpkg files
+      shell: |
+        rm -rf /var/lib/dpkg/updates/*
+        touch /var/lib/dpkg/status
+      changed_when: true
+    
+    - name: Fix dpkg database
+      shell: |
+        mkdir -p /var/lib/dpkg/info
+        mkdir -p /var/lib/dpkg/updates
+        dpkg --clear-avail
+        apt-get update --fix-missing
+        apt-get install -f -y
+        apt-get clean
+      changed_when: true
+      ignore_errors: yes
+    
+    - name: Fix interrupted dpkg (if any)
+      shell: dpkg --configure -a
+      ignore_errors: yes
+      changed_when: false
+      
+    - name: Remove old Kubernetes repository (if exists)
+      file:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        state: absent
+      
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - docker.io
+          - python3-pip
+          - python3-venv
+          - python3-dev
+          - libffi-dev
+          - libssl-dev
+          - git
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+        state: present
+    
+    - name: Create Kubernetes apt keyring directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+    
+    - name: Add Kubernetes apt key
+      shell: curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    
+    - name: Add Kubernetes apt repository
+      shell: echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+      args:
+        creates: /etc/apt/sources.list.d/kubernetes.list
+    
+    - name: Update apt cache after adding Kubernetes repo
+      apt:
+        update_cache: yes
+    
+    - name: Install Kubernetes components
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+    
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+    
+    - name: Ensure containerd directory exists
+      file:
+        path: /etc/containerd
+        state: directory
+    
+    - name: Configure containerd
+      shell: |
+        containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+        sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+    
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+    
+    - name: Load kernel modules
+      shell: |
+        modprobe overlay
+        modprobe br_netfilter
+    
+    - name: Apply sysctl parameters
+      shell: sysctl --system
+    
+    - name: Disable swap
+      shell: |
+        swapoff -a
+        sed -i '/swap/d' /etc/fstab
+    
+    - name: Enable and start kubelet
+      systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    - name: Restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+        
+    - name: Add {{ k8s_username }} to docker group
+      user:
+        name: "{{ k8s_username }}"
+        groups: docker
+        append: yes
+        
+    - name: Update all packages
+      apt:
+        update_cache: yes
+        upgrade: full
+        autoremove: yes
+        autoclean: yes
+      register: apt_upgrade
+        
+    - name: Reboot nodes
+      reboot:
+        msg: "Rebooting after system updates"
+        connect_timeout: 5
+        reboot_timeout: 300
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+        test_command: uptime
+      when: apt_upgrade.changed
