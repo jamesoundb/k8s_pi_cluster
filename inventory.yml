@@ -1,0 +1,61 @@
+---
+# Kubernetes Cluster Inventory
+
+all:
+  children:
+    # Control Plane Nodes (Raspberry Pi) - Multi-master setup
+    k8s_master:
+      hosts:
+        k8s-node-1:
+          ansible_host: 192.168.1.80
+          ansible_user: k8s_80
+          node_role: control-plane
+        k8s-node-2:
+          ansible_host: 192.168.1.81
+          ansible_user: k8s_81
+          node_role: control-plane
+        k8s-node-3:
+          ansible_host: 192.168.1.82
+          ansible_user: k8s_82
+          node_role: control-plane
+      children:
+        # First control plane node (initialization node)
+        k8s_master_init:
+          hosts:
+            k8s-node-1:
+        # Additional control plane nodes
+        k8s_master_secondary:
+          hosts:
+            k8s-node-2:
+            k8s-node-3:
+    
+    # Worker Nodes (currently none as all Raspberry Pi nodes are control plane)
+    k8s_workers:
+      children:
+        # Raspberry Pi Worker Nodes
+        k8s_workers_pi:
+          hosts: {}
+        # Lenovo M920Q Worker Nodes (for future use)
+        k8s_workers_x86:
+          hosts: {}
+          # Add Lenovo nodes here when available
+          # lenovo-worker-1:
+          #   ansible_host: 192.168.1.90
+          #   ansible_user: ubuntu
+          #   node_role: worker
+    
+    # Group for all Kubernetes nodes
+    k8s_nodes:
+      children:
+        k8s_master:
+        k8s_workers:
+    
+    # Group for all Raspberry Pi nodes
+    raspberry_pi:
+      children:
+        k8s_master:
+        k8s_workers_pi:
+
+  vars:
+    ansible_ssh_private_key_file: ~/.ssh/id_rsa
+    ansible_python_interpreter: /usr/bin/python3
