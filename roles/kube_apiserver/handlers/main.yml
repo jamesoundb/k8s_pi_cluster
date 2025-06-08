@@ -1,0 +1,12 @@
+---
+# Handlers for kube-apiserver role
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: yes
+
+- name: Restart HAProxy
+  systemd:
+    name: haproxy
+    state: restarted
+    enabled: yes

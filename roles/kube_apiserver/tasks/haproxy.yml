@@ -1,0 +1,22 @@
+---
+# This file contains tasks to install and configure HAProxy for the Kubernetes API server
+
+- name: Install HAProxy for API server load balancing
+  apt:
+    name: haproxy
+    state: present
+    update_cache: yes
+
+- name: Configure HAProxy for Kubernetes API server
+  template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    mode: '0644'
+  register: haproxy_config
+
+- name: Restart HAProxy
+  systemd:
+    name: haproxy
+    state: restarted
+    enabled: yes
+  when: haproxy_config.changed

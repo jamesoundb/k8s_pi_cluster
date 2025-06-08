@@ -1,0 +1,113 @@
+---
+# Post-installation playbook for deploying core infrastructure components
+
+- name: Deploy core infrastructure components
+  hosts: k8s_master_init
+  become: true
+  become_user: "{{ ansible_user }}"
+  tasks:
+    - name: Create namespace for ArgoCD
+      shell: kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+      register: namespace_result
+      changed_when: "'created' in namespace_result.stdout"
+      ignore_errors: true
+
+    - name: Add Helm repository for ArgoCD
+      shell: helm repo add argo https://argoproj.github.io/argo-helm
+      register: argo_repo_add
+      changed_when: "'has been added' in argo_repo_add.stdout"
+
+    - name: Update Helm repositories
+      shell: helm repo update
+      register: repo_update
+      changed_when: "'has been added' in repo_update.stdout or 'has been updated' in repo_update.stdout"
+
+    - name: Install ArgoCD with Helm
+      shell: >
+        helm upgrade --install argocd argo/argo-cd
+        --namespace argocd
+        --version 3.35.4
+        --set server.service.type=ClusterIP
+        --set controller.resources.limits.cpu=300m
+        --set controller.resources.limits.memory=512Mi
+        --set server.resources.limits.cpu=300m
+        --set server.resources.limits.memory=512Mi
+        --set repoServer.resources.limits.cpu=300m
+        --set repoServer.resources.limits.memory=512Mi
+        --set applicationSet.resources.limits.cpu=300m
+        --set applicationSet.resources.limits.memory=512Mi
+        --set redis.resources.limits.cpu=200m
+        --set redis.resources.limits.memory=128Mi
+      register: argocd_install
+      changed_when: "'has been upgraded' in argocd_install.stdout or 'has been installed' in argocd_install.stdout"
+
+    - name: Wait for ArgoCD pods to be ready
+      shell: kubectl -n argocd wait --for=condition=ready pods --selector=app.kubernetes.io/name=argocd-server --timeout=300s
+      register: argocd_ready
+      until: argocd_ready.rc == 0
+      retries: 10
+      delay: 30
+      ignore_errors: true
+
+    - name: Get ArgoCD initial admin password
+      shell: kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+      register: argocd_password
+      changed_when: false
+      ignore_errors: true
+
+    - name: Display ArgoCD initial admin password
+      debug:
+        msg: "ArgoCD initial admin password: {{ argocd_password.stdout }}"
+      when: argocd_password.stdout is defined
+
+    - name: Create namespace for cert-manager
+      shell: kubectl create namespace cert-manager --dry-run=client -o yaml | kubectl apply -f -
+      register: cm_namespace_result
+      changed_when: "'created' in cm_namespace_result.stdout"
+      ignore_errors: true
+
+    - name: Add Jetstack Helm repository for cert-manager
+      shell: helm repo add jetstack https://charts.jetstack.io
+      register: jetstack_repo_add
+      changed_when: "'has been added' in jetstack_repo_add.stdout"
+
+    - name: Update Helm repositories again
+      shell: helm repo update
+      register: repo_update_again
+      changed_when: "'has been updated' in repo_update_again.stdout"
+
+    - name: Install cert-manager with Helm
+      shell: >
+        helm upgrade --install cert-manager jetstack/cert-manager
+        --namespace cert-manager
+        --version v1.13.2
+        --set installCRDs=true
+        --set resources.requests.cpu=10m
+        --set resources.requests.memory=32Mi
+        --set resources.limits.cpu=100m
+        --set resources.limits.memory=128Mi
+      register: certmanager_install
+      changed_when: "'has been upgraded' in certmanager_install.stdout or 'has been installed' in certmanager_install.stdout"
+
+    - name: Add NGINX Ingress Controller repository
+      shell: helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+      register: nginx_repo_add
+      changed_when: "'has been added' in nginx_repo_add.stdout"
+
+    - name: Create namespace for ingress-nginx
+      shell: kubectl create namespace ingress-nginx --dry-run=client -o yaml | kubectl apply -f -
+      register: ingress_namespace_result
+      changed_when: "'created' in ingress_namespace_result.stdout"
+      ignore_errors: true
+
+    - name: Install NGINX Ingress Controller with Helm
+      shell: >
+        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx
+        --namespace ingress-nginx
+        --set controller.service.type=NodePort
+        --set controller.resources.requests.cpu=100m
+        --set controller.resources.requests.memory=90Mi
+        --set controller.resources.limits.cpu=200m
+        --set controller.resources.limits.memory=256Mi
+      register: nginx_install
+      changed_when: "'has been upgraded' in nginx_install.stdout or 'has been installed' in nginx_install.stdout"

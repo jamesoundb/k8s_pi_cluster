@@ -1,0 +1,14 @@
+#!/bin/sh
+
+APISERVER_VIP={{ control_plane_vip }}
+APISERVER_DEST_PORT={{ control_plane_endpoint_port | default('6443') }}
+
+errorExit() {
+    echo "*** $*" 1>&2
+    exit 1
+}
+
+curl --silent --max-time 2 --insecure https://${APISERVER_VIP}:${APISERVER_DEST_PORT}/ -o /dev/null || errorExit "Error: API server connection failed"
+if ip addr | grep -q ${APISERVER_VIP}; then
+    curl --silent --max-time 2 --insecure https://localhost:${APISERVER_DEST_PORT}/ -o /dev/null || errorExit "Error: API server connection failed locally"
+fi

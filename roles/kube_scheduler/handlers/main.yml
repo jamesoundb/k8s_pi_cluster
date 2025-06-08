@@ -1,0 +1,6 @@
+---
+# Handlers for kube-scheduler role
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: yes

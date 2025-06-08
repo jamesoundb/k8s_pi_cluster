@@ -1,0 +1,370 @@
+---
+# Playbook for joining a single secondary control plane node to the cluster
+# Usage: ansible-playbook -i inventory.yml playbooks/join-single-control-plane.yml -e "target_node=k8s-node-2" -v
+
+- name: Join a single secondary control plane node
+  hosts: "{{ target_node }}"
+  become: true
+  gather_facts: true
+  vars:
+    master_node: "{{ groups['k8s_master_init'][0] }}"
+  tasks:
+    - name: Verify target node is defined
+      fail:
+        msg: "Please specify a target node with -e 'target_node=hostname'"
+      when: target_node is not defined
+      
+    - name: Reset any previous Kubernetes configuration
+      shell: kubeadm reset --force
+      ignore_errors: true
+      
+    - name: Clean up any network interfaces and remnants
+      shell: |
+        ip link delete cni0 || true
+        ip link delete flannel.1 || true
+        rm -rf /etc/cni/net.d/* || true
+        find /etc/kubernetes/pki/ -type f -not -path "*/.*" -delete || true
+        rm -f /etc/kubernetes/kubelet.conf || true
+        rm -rf /etc/kubernetes/manifests/* || true
+      ignore_errors: true
+      
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+        
+    - name: Kill any running kubelet processes first
+      shell: pkill -9 -f kubelet || true
+      ignore_errors: true
+      
+    - name: Wait briefly for processes to terminate
+      pause:
+        seconds: 2
+        
+    - name: Stop kubelet service
+      systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: true
+      
+    - name: Wait to ensure processes have stopped
+      pause:
+        seconds: 5
+        
+    - name: Check that port 10250 is free
+      shell: |
+        if netstat -tulpn | grep -q 10250; then
+          echo "Port 10250 is still in use"
+          fuser -k 10250/tcp
+          exit 1
+        else
+          echo "Port 10250 is free"
+          exit 0
+        fi
+      register: port_check
+      ignore_errors: true
+      
+    - name: Generate certificate and token on master
+      delegate_to: "{{ master_node }}"
+      block:
+        - name: Remove existing certificate secrets if present
+          shell: |
+            kubectl --kubeconfig=/etc/kubernetes/admin.conf get secret -n kube-system kubeadm-certs &>/dev/null && \
+            kubectl --kubeconfig=/etc/kubernetes/admin.conf delete secret -n kube-system kubeadm-certs || \
+            echo "No existing certs to delete"
+          ignore_errors: true
+          
+        - name: Wait for deletion to complete
+          pause:
+            seconds: 5
+            
+        - name: Generate new certificate key
+          shell: |
+            # Reset any existing certificate state
+            kubeadm reset phase upload-certs 2>/dev/null || true
+            
+            # Generate a fresh key and upload certificates
+            CERT_KEY=$(openssl rand -hex 32)
+            echo "EXTRACTED_CERT_KEY:$CERT_KEY"
+            
+            # Use the verbose flag to ensure proper certificate upload
+            kubeadm init phase upload-certs --upload-certs --certificate-key=$CERT_KEY --v=5
+            
+            # Wait briefly for the secret to be fully available
+            sleep 2
+            
+            # Verify the secret exists in the kube-system namespace
+            kubectl --kubeconfig=/etc/kubernetes/admin.conf get secret -n kube-system kubeadm-certs
+            
+            # Output the key again to ensure we can extract it
+            echo "FINAL_CERT_KEY:$CERT_KEY"
+          register: cert_key_output
+          
+        - name: Extract certificate key
+          set_fact:
+            cert_key: "{{ cert_key_output.stdout_lines | select('match', '^FINAL_CERT_KEY:') | first | regex_replace('^FINAL_CERT_KEY:', '') }}"
+          
+        - name: Create bootstrap token
+          shell: kubeadm token create --ttl 2h
+          register: token_output
+          
+        - name: Extract token
+          set_fact:
+            bootstrap_token: "{{ token_output.stdout }}"
+            
+        - name: Get CA certificate hash
+          shell: openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'
+          register: ca_hash
+          
+        - name: Create join command
+          set_fact:
+            join_command: "kubeadm join 192.168.1.100:6443 --token {{ bootstrap_token }} --discovery-token-ca-cert-hash sha256:{{ ca_hash.stdout }} --control-plane --certificate-key {{ cert_key }}"
+
+    - name: Display join command
+      debug:
+        msg: "Will execute: {{ join_command }}"
+        
+    - name: Wait to ensure API server is ready
+      delegate_to: "{{ master_node }}"
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw='/readyz'
+      register: api_status
+      until: api_status.stdout == "ok"
+      retries: 20
+      delay: 3
+      changed_when: false
+
+    - name: Restart containerd and kubelet services
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        daemon_reload: yes
+      with_items:
+        - containerd
+        - kubelet
+      ignore_errors: true
+
+    - name: Configure network settings for optimal Kubernetes operation
+      shell: |
+        # Configure bridge netfilter settings
+        cat > /etc/sysctl.d/99-kubernetes-cri.conf << EOF
+        net.bridge.bridge-nf-call-iptables = 1
+        net.bridge.bridge-nf-call-ip6tables = 1
+        net.ipv4.ip_forward = 1
+        EOF
+        
+        # Apply settings immediately
+        sysctl --system
+        
+        # Ensure correct DNS resolution
+        cat > /etc/resolv.conf << EOF
+        nameserver 8.8.8.8
+        nameserver 8.8.4.4
+        EOF
+
+        # Update hosts file to ensure proper node resolution
+        grep -q "192.168.1.100" /etc/hosts || echo "192.168.1.100 kubernetes" >> /etc/hosts
+        grep -q "192.168.1.80" /etc/hosts || echo "192.168.1.80 k8s-node-1" >> /etc/hosts
+        grep -q "192.168.1.81" /etc/hosts || echo "192.168.1.81 k8s-node-2" >> /etc/hosts
+        grep -q "192.168.1.82" /etc/hosts || echo "192.168.1.82 k8s-node-3" >> /etc/hosts
+
+        # Test connectivity to the API server load balancer
+        echo "Testing API server connectivity..."
+        timeout 5 bash -c "cat < /dev/null > /dev/tcp/192.168.1.100/6443" && echo "API server is reachable on port 6443" || echo "Failed to connect to API server"
+        
+        # Verify /sys bridge settings for nf_call_iptables
+        echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables
+        echo 1 > /proc/sys/net/bridge/bridge-nf-call-ip6tables
+      ignore_errors: true
+
+    - name: Stop kubelet service
+      systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: true
+
+    - name: Kill any running kubelet processes
+      shell: pkill -9 -f kubelet || true
+      ignore_errors: true
+
+    - name: Find and kill process using port 10250
+      shell: |
+        if netstat -tulpn | grep -q 10250; then
+          PID=$(netstat -tulpn | grep 10250 | awk '{print $7}' | cut -d'/' -f1)
+          if [ ! -z "$PID" ]; then
+            echo "Found process $PID using port 10250, killing it"
+            kill -9 $PID || true
+          fi
+          fuser -k 10250/tcp || true
+        fi
+      ignore_errors: true
+
+    - name: Clean up kubelet directories and files
+      shell: |
+        # Clean up kubelet directories and files
+        rm -rf /etc/kubernetes/bootstrap-kubelet.conf
+        rm -rf /etc/kubernetes/kubelet.conf
+        rm -rf /etc/kubernetes/pki/ca.crt
+        rm -rf /var/lib/kubelet/pki
+      ignore_errors: true
+
+    - name: Create fresh kubelet directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      with_items:
+        - /var/lib/kubelet
+        - /etc/kubernetes/pki
+        - /etc/kubernetes/manifests
+
+    - name: Configure systemd kubelet service
+      copy:
+        dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+        content: |
+          [Service]
+          Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+          Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+          # This is a file that "kubeadm init" and "kubeadm join" generates at runtime, populating the KUBELET_KUBEADM_ARGS variable dynamically
+          EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+          # This is a file that the user can use for overrides of the kubelet args as a last resort. Preferably, the user should use
+          # the .NodeRegistration.KubeletExtraArgs object in the configuration files instead. KUBELET_EXTRA_ARGS should be sourced from this file.
+          EnvironmentFile=-/etc/default/kubelet
+          ExecStart=
+          ExecStart=/usr/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Wait for port 10250 to be fully released
+      shell: |
+        for i in $(seq 1 5); do
+          if ! netstat -tulpn | grep -q 10250; then
+            echo "Port 10250 is free"
+            exit 0
+          fi
+          echo "Waiting for port 10250 to be released... ($i/5)"
+          sleep 3
+        done
+        echo "Port 10250 is still in use after waiting"
+        exit 1
+      register: port_wait
+      ignore_errors: true
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+      
+    - name: Join control plane with extended timeout
+      shell: |
+        # Create time file to track kubelet restart
+        echo "$(date)" > /tmp/kubelet-restart-time
+        
+        # Run join command with extended timeout
+        timeout 600 {{ join_command }} --ignore-preflight-errors=Port-10250,FileAvailable--etc-kubernetes-kubelet.conf,DirAvailable--var-lib-etcd --v=5
+      register: join_result
+      ignore_errors: true
+      
+    - name: Display join result
+      debug:
+        var: join_result
+        verbosity: 0
+      
+    - name: Fix kubelet configuration if join failed
+      when: join_result.rc is defined and join_result.rc != 0
+      block:
+        - name: Check if bootstrap kubeconfig exists
+          stat:
+            path: /etc/kubernetes/bootstrap-kubelet.conf
+          register: bootstrap_file
+          
+        - name: Check if kubelet.conf exists
+          stat:
+            path: /etc/kubernetes/kubelet.conf
+          register: kubelet_conf_file
+          
+        - name: Configure kubelet manually if join created bootstrap file but failed
+          when: bootstrap_file.stat.exists and not kubelet_conf_file.stat.exists
+          shell: |
+            # Backup existing manifests if they exist
+            if [ -d /etc/kubernetes/manifests ]; then
+              mkdir -p /etc/kubernetes/manifests.backup
+              cp /etc/kubernetes/manifests/*.yaml /etc/kubernetes/manifests.backup/ 2>/dev/null || true
+            fi
+            
+            # Ensure proper DNS configuration for kubelet
+            cat > /etc/systemd/system/kubelet.service.d/20-dns.conf << EOF
+            [Service]
+            Environment="KUBELET_EXTRA_ARGS=--cluster-dns=10.96.0.10 --cluster-domain=cluster.local"
+            EOF
+            
+            # Restart services
+            systemctl daemon-reload
+            systemctl restart kubelet
+            
+            # Wait for kubelet to perform TLS bootstrap using the bootstrap-kubelet.conf
+            echo "Waiting for kubelet to bootstrap with API server..."
+            for i in $(seq 1 12); do
+              if [ -f /etc/kubernetes/kubelet.conf ]; then
+                echo "Bootstrap successful, kubelet.conf created"
+                break
+              fi
+              echo "Waiting for bootstrap to complete... ($i/12)"
+              sleep 10
+            done
+          register: manual_bootstrap
+
+    - name: Wait for kubelet to start if join was successful
+      pause:
+        seconds: 30
+      when: join_result is success or (manual_bootstrap is defined and manual_bootstrap.rc == 0)
+      
+    - name: Check kubelet status
+      shell: systemctl status kubelet || true
+      register: kubelet_status
+      changed_when: false
+      
+    - name: Display kubelet status
+      debug:
+        var: kubelet_status.stdout_lines
+        
+    - name: Verify API server pod is running
+      shell: |
+        if [ -f /etc/kubernetes/manifests/kube-apiserver.yaml ]; then
+          echo "API server manifest exists"
+          
+          # Check if pod is running
+          if [ -d /etc/kubernetes/manifests/ ] && [ "$(ls -A /etc/kubernetes/manifests/)" ]; then
+            echo "Manifests directory has files"
+          else
+            echo "Manifests directory is empty"
+          fi
+        else
+          echo "API server manifest does not exist"
+        fi
+      register: apiserver_check
+      
+    - name: Display API server status
+      debug:
+        var: apiserver_check.stdout_lines
+        
+    - name: Create kube config directory for user
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+      when: join_result is success
+      
+    - name: Copy kubeconfig to user directory
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+      ignore_errors: true
+      when: join_result is success

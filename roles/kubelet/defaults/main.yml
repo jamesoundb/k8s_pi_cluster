@@ -1,0 +1,20 @@
+---
+# Default variables for kubelet role
+
+# Resource configurations for Raspberry Pi (arm)
+arm_resource_settings:
+  eviction_hard: "memory.available<500Mi,nodefs.available<10%,nodefs.inodesFree<5%"
+  system_reserved: "memory=200Mi,cpu=200m"
+  kube_reserved: "memory=300Mi,cpu=300m"
+
+# Resource configurations for x86 nodes (Lenovo)
+x86_resource_settings:
+  eviction_hard: "memory.available<1Gi,nodefs.available<10%,nodefs.inodesFree<5%"
+  system_reserved: "memory=512Mi,cpu=500m"
+  kube_reserved: "memory=512Mi,cpu=500m"
+
+# Worker node specific settings
+worker_kubelet_extra_args: ""
+  
+# Control plane node specific settings
+control_plane_kubelet_extra_args: ""

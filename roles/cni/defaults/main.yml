@@ -1,0 +1,14 @@
+---
+# Default variables for CNI role
+
+# CNI provider configuration
+cni_provider: "flannel"
+flannel_manifest_url: "https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml"
+pod_network_cidr: "10.244.0.0/16"
+
+# Keepalived configuration
+keepalived_virtual_ip: "192.168.1.100"
+keepalived_virtual_router_id: 51
+keepalived_auth_pass: "K8SHA_SECRET"
+keepalived_check_interval: 3
+keepalived_interface: "eth0"

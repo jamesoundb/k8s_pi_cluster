@@ -1,0 +1,114 @@
+---
+# Network Infrastructure Playbook - Handles HAProxy and Keepalived
+# This sets up the virtual IP and load balancing for the HA control plane
+
+- name: Configure Network Infrastructure
+  hosts: k8s_master_init
+  become: true
+  vars:
+    vip_address: "192.168.1.100"  # Virtual IP for the control plane
+    vip_interface: "eth0"         # Network interface for the VIP
+    control_plane_vip: "192.168.1.100"  # Added for template compatibility
+    control_plane_endpoint: "192.168.1.100" # VIP address for HAProxy template
+    control_plane_endpoint_port: 6443    # External port for API server via HAProxy
+    api_server_port: 6444                # Internal port where kube-apiserver will listen
+    lb_port: 6443                        # Port where HAProxy will listen
+    haproxy_stats_password: "kubernetes" # Password for HAProxy stats page
+  
+  tasks:
+    # Keepalived Installation
+    - name: Install Keepalived
+      apt:
+        name: keepalived
+        state: present
+        update_cache: yes
+    
+    - name: Create check_apiserver script
+      template:
+        src: ../roles/cni/templates/check_apiserver.sh.j2
+        dest: /etc/keepalived/check_apiserver.sh
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: Configure Keepalived with proper priorities
+      template:
+        src: ../roles/cni/templates/keepalived.conf.j2
+        dest: /etc/keepalived/keepalived.conf
+        mode: '0644'
+        owner: root
+        group: root
+      vars:
+        priority: "{{ '100' if inventory_hostname == groups['k8s_master_init'][0] else '90' }}"
+
+    - name: Enable and restart Keepalived service
+      systemd:
+        name: keepalived
+        state: restarted
+        enabled: yes
+
+    # HAProxy Installation and Configuration
+    - name: Install HAProxy
+      apt:
+        name: haproxy
+        state: present
+        update_cache: yes
+    
+    - name: Configure HAProxy for Kubernetes API server
+      template:
+        src: ../roles/kube_apiserver/templates/haproxy.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+        owner: root
+        group: root
+        mode: '0644'
+      vars:
+        api_server_port: 6444    # The port where kube-apiserver will listen
+        lb_port: 6443            # The port where HAProxy will listen (standard API server port)
+      notify: restart haproxy
+
+    - name: Check network configuration
+      shell: ip addr show {{ vip_interface }} | grep "inet "
+      register: ip_config
+      changed_when: false
+
+    - name: Display current network configuration
+      debug:
+        var: ip_config.stdout_lines
+
+    # Ensure that port 6443 is free before HAProxy starts
+    - name: Check if something is using port 6443
+      shell: ss -tlnp | grep 6443 || echo "No process using port 6443"
+      register: port_check
+      changed_when: false
+    
+    - name: Display process using port 6443 if any
+      debug:
+        var: port_check.stdout_lines
+    
+    # This must be done after stopping any Kubernetes API server that might be using port 6443
+    - name: Enable and start HAProxy
+      systemd:
+        name: haproxy
+        state: restarted
+        enabled: yes
+      # Only restart if not already running or if configuration has changed
+      when: port_check.stdout is search('No process using port 6443') or ansible_hostname == ansible_play_hosts[0]
+
+    - name: Wait for HAProxy to be listening on port 6443
+      wait_for:
+        port: 6443
+        host: "{{ vip_address }}"
+        timeout: 30
+        state: started
+      ignore_errors: true
+      register: haproxy_check
+
+    - name: Display HAProxy status
+      debug:
+        msg: "HAProxy listening on {{ vip_address }}:6443: {{ haproxy_check.state == 'started' }}"
+
+  handlers:
+    - name: restart haproxy
+      systemd:
+        name: haproxy
+        state: restarted

@@ -1,0 +1,18 @@
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+authentication:
+  anonymous:
+    enabled: true
+  webhook:
+    enabled: false
+  x509:
+    clientCAFile: ""
+authorization:
+  mode: AlwaysAllow
+clusterDomain: cluster.local
+clusterDNS:
+- 10.245.0.10
+resolvConf: /run/systemd/resolve/resolv.conf
+runtimeRequestTimeout: 15m
+cgroupDriver: systemd
+failSwapOn: false

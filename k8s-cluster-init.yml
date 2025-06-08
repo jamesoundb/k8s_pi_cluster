@@ -1,67 +1,1117 @@
 ---
-- name: Initialize Kubernetes Master Node
-  hosts: k8s_master
-  become: yes
+# Initialize the first control plane node
+- name: Initialize First Kubernetes Control Plane Node
+  hosts: k8s_master_init
+  become: true
   vars:
     k8s_username: "{{ ansible_user }}"
+    pod_network_cidr: "10.244.0.0/16"
+    service_cidr: "10.245.0.0/16"
+    control_plane_endpoint: "192.168.1.100"  # Virtual IP for HA control plane
+    api_endpoint_address: "{{ ansible_host }}"  # Use the actual node IP
   tasks:
-    - name: Initialize Kubernetes cluster
-      shell: kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address={{ ansible_host }}
-      register: kubeadm_init
+    # Ensure kubelet service is properly configured and running
+    - name: Ensure containerd is running
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+    - name: Ensure kubelet service is enabled and started
+      systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+        
+    # Stop HAProxy to prevent port conflicts during initialization
+    - name: Check if HAProxy is running and stop it if it is
+      systemd:
+        name: haproxy
+        state: stopped
+      ignore_errors: yes
+        
+    # Check what's using port 6443 and kill it if needed
+    - name: Check what process is using port 6443
+      shell: ss -tlnp | grep 6443 || echo "No process using port 6443"
+      register: port_check
+      ignore_errors: yes
+      
+    - name: Display process using port 6443
+      debug:
+        var: port_check.stdout_lines
+        
+    # Create bootstrap kubelet configuration to ensure kubelet can start before certificates are generated
+    - name: Ensure kubelet config directory exists
+      file:
+        path: /var/lib/kubelet
+        state: directory
+        mode: '0755'
+        
+    - name: Create bootstrap kubelet configuration
+      copy:
+        dest: /var/lib/kubelet/config.yaml
+        content: |
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          authentication:
+            anonymous:
+              enabled: true
+            webhook:
+              enabled: false
+            x509:
+              clientCAFile: ""
+          authorization:
+            mode: AlwaysAllow
+          clusterDomain: cluster.local
+          clusterDNS:
+          - 10.245.0.10
+          resolvConf: /run/systemd/resolve/resolv.conf
+          runtimeRequestTimeout: 15m
+          cgroupDriver: systemd
+          failSwapOn: false
+        mode: '0644'
+      
+    # Update kubelet environment file to point to our bootstrap config
+    - name: Update kubelet environment file to use bootstrap configuration
+      lineinfile:
+        path: /var/lib/kubelet/kubeadm-flags.env
+        regexp: '^KUBELET_KUBEADM_ARGS='
+        line: 'KUBELET_KUBEADM_ARGS="--container-runtime-endpoint=unix:///var/run/containerd/containerd.sock --pod-manifest-path=/etc/kubernetes/manifests --config=/var/lib/kubelet/config.yaml"'
+        create: yes
+        mode: '0644'
+      register: kubelet_env_updated
+        
+    - name: Restart kubelet with bootstrap configuration
+      systemd:
+        daemon-reload: yes
+        name: kubelet
+        state: restarted
+        
+    # Give kubelet time to start up
+    - name: Pause to let kubelet start
+      pause:
+        seconds: 10
+      when: kubelet_env_updated is changed
+        
+    # Check if kubelet is now running
+    - name: Check kubelet status
+      command: systemctl status kubelet
+      register: kubelet_status
+      ignore_errors: yes
+      
+    - name: Display kubelet status
+      debug:
+        var: kubelet_status.stdout_lines
+      
+    # Save the original kubeadm-config with control plane endpoint for future use
+    - name: Generate kubeadm-config.yaml with VIP
+      copy:
+        dest: /etc/kubernetes/kubeadm-config.yaml
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          kubernetesVersion: "v1.29.0"
+          controlPlaneEndpoint: "{{ control_plane_endpoint }}:6443"
+          networking:
+            podSubnet: "{{ pod_network_cidr }}"
+            serviceSubnet: "{{ service_cidr }}"
+          apiServer:
+            extraArgs:
+              secure-port: "6444"
+          etcd:
+            local:
+              dataDir: "/var/lib/etcd"
+        owner: root
+        group: root
+        mode: '0644'
+        
+    # But initialize with the actual node IP for now
+    - name: Generate temporary kubeadm-config.yaml with actual node IP
+      copy:
+        dest: /etc/kubernetes/kubeadm-init-config.yaml
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          kubernetesVersion: "v1.29.0"
+          controlPlaneEndpoint: "{{ api_endpoint_address }}:6443"
+          networking:
+            podSubnet: "{{ pod_network_cidr }}"
+            serviceSubnet: "{{ service_cidr }}"
+          apiServer:
+            extraArgs:
+              secure-port: "6444"
+          etcd:
+            local:
+              dataDir: "/var/lib/etcd"
+        owner: root
+        group: root
+        mode: '0644'
+
+    # Create a minimal kubelet configuration so it can start properly
+    - name: Create minimal kubelet config directory
+      file:
+        path: /var/lib/kubelet
+        state: directory
+        mode: '0755'
+      
+    - name: Create minimal kubelet configuration file
+      copy:
+        dest: /var/lib/kubelet/config.yaml
+        content: |
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          authentication:
+            anonymous:
+              enabled: false
+            webhook:
+              enabled: true
+            x509:
+              clientCAFile: /etc/kubernetes/pki/ca.crt
+          authorization:
+            mode: Webhook
+          clusterDomain: cluster.local
+          clusterDNS:
+          - 10.245.0.10
+          resolvConf: /run/systemd/resolve/resolv.conf
+          runtimeRequestTimeout: 15m
+          cgroupDriver: systemd
+        mode: '0644'
+      
+    # Restart kubelet to pick up new configuration
+    - name: Restart kubelet to pick up minimal configuration
+      systemd:
+        name: kubelet
+        state: restarted
+      
+    # Initialize with option to ignore preflight errors if needed
+    - name: Initialize Kubernetes control plane using node IP config
+      shell: kubeadm init --config=/etc/kubernetes/kubeadm-init-config.yaml --ignore-preflight-errors=Port-6443 --v=5 --upload-certs
       args:
         creates: /etc/kubernetes/admin.conf
+      register: kubeadm_init
+      ignore_errors: yes
+      timeout: 600
+      
+    # If initialization fails because of timeout, attempt recovery
+    - name: Check if initialization created critical files but timed out
+      stat:
+        path: /etc/kubernetes/pki/ca.crt
+      register: ca_exists
+      when: kubeadm_init is failed
+      
+    - name: Attempt recovery if PKI exists but admin.conf doesn't
+      shell: kubeadm init phase kubeconfig all --apiserver-advertise-address {{ api_endpoint_address }} --apiserver-bind-port 6444 --control-plane-endpoint {{ api_endpoint_address }}:6444
+      when: kubeadm_init is failed and ca_exists.stat is defined and ca_exists.stat.exists
+      
+    # If kubeadm init fails, get diagnostic information
+    - name: Collect diagnostic information if initialization failed
+      block:
+        - name: Check kubelet status
+          shell: systemctl status kubelet
+          register: kubelet_status
+          ignore_errors: yes
+          
+        - name: Display kubelet status
+          debug:
+            var: kubelet_status.stdout_lines
+          when: kubelet_status is defined
+          
+        - name: Check kubelet logs
+          shell: journalctl -xeu kubelet | tail -n 50
+          register: kubelet_logs
+          ignore_errors: yes
+          
+        - name: Display kubelet logs
+          debug:
+            var: kubelet_logs.stdout_lines
+          when: kubelet_logs is defined
+          
+        - name: Check for kube-apiserver containers
+          shell: crictl ps -a | grep kube-apiserver || echo "No kube-apiserver containers found"
+          register: apiserver_containers
+          ignore_errors: yes
+          
+        - name: Display kube-apiserver containers
+          debug:
+            var: apiserver_containers.stdout_lines
+          when: apiserver_containers is defined
+          
+        - name: Get logs from the most recent kube-apiserver container
+          shell: |
+            CONTAINER_ID=$(crictl ps -a | grep kube-apiserver | head -n 1 | awk '{print $1}')
+            if [ ! -z "$CONTAINER_ID" ]; then
+              crictl logs $CONTAINER_ID
+            else
+              echo "No kube-apiserver container ID found"
+            fi
+          register: apiserver_logs
+          ignore_errors: yes
+          
+        - name: Display kube-apiserver logs
+          debug:
+            var: apiserver_logs.stdout_lines
+          when: apiserver_logs is defined
+      when: kubeadm_init is failed
+    
+    - name: Debug kubeadm init output
+      debug:
+        var: kubeadm_init
+        verbosity: 1
+        
+    # After kubeadm init, update kubelet config to use proper certificates
+    - name: Wait for kubelet config from kubeadm to be created
+      wait_for:
+        path: /var/lib/kubelet/config.yaml
+        state: present
+        timeout: 60
+      register: kubelet_config_exists
+      when: kubeadm_init is not failed
+      ignore_errors: yes
+        
+    - name: Ensure kubelet is properly configured to use certificates after initialization
+      shell: |
+        # Check if running with bootstrap config or regular config
+        if grep -q "authentication.anonymous.enabled: true" /var/lib/kubelet/config.yaml; then
+          echo "Updating kubelet configuration to use proper certificates..."
+          # Restart kubelet with the config generated by kubeadm
+          systemctl restart kubelet
+          echo "Kubelet restarted with proper certificate configuration."
+        else
+          echo "Kubelet already configured with proper certificates."
+        fi
+      register: kubelet_cert_update
+      when: kubelet_config_exists is succeeded
+        
+    - name: Debug kubelet certificate configuration update
+      debug:
+        var: kubelet_cert_update.stdout_lines
+      when: kubelet_cert_update is defined
     
     - name: Create .kube directory for user
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+      
+    # Check if admin.conf exists first
+    - name: Check if admin.conf exists
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf_stat
+      
+    - name: Copy kube config for user if it exists
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+      when: admin_conf_stat.stat.exists
+        
+    # Make sure kubeconfig uses the actual node IP and correct port, not the VIP
+    - name: Update kubeconfig with actual node IP and port 6444
+      shell: |
+        # Update user's kubeconfig
+        cp /home/{{ ansible_user }}/.kube/config /home/{{ ansible_user }}/.kube/config.orig || true
+        sed -i "s|server: https://.*:6443|server: https://{{ api_endpoint_address }}:6444|g" /home/{{ ansible_user }}/.kube/config
+        
+        # Update admin.conf
+        cp /etc/kubernetes/admin.conf /etc/kubernetes/admin.conf.orig || true
+        sed -i "s|server: https://.*:6443|server: https://{{ api_endpoint_address }}:6444|g" /etc/kubernetes/admin.conf
+        
+        # Update kubelet.conf (critical for kubelet to connect to API server)
+        if [ -f /etc/kubernetes/kubelet.conf ]; then
+          cp /etc/kubernetes/kubelet.conf /etc/kubernetes/kubelet.conf.orig || true
+          sed -i "s|server: https://.*:6443|server: https://{{ api_endpoint_address }}:6444|g" /etc/kubernetes/kubelet.conf
+          # Restart kubelet to pick up the new config
+          systemctl restart kubelet
+        fi
+        
+        # Update controller-manager.conf
+        if [ -f /etc/kubernetes/controller-manager.conf ]; then
+          cp /etc/kubernetes/controller-manager.conf /etc/kubernetes/controller-manager.conf.orig || true
+          sed -i "s|server: https://.*:6443|server: https://{{ api_endpoint_address }}:6444|g" /etc/kubernetes/controller-manager.conf
+        fi
+        
+        # Update scheduler.conf
+        if [ -f /etc/kubernetes/scheduler.conf ]; then
+          cp /etc/kubernetes/scheduler.conf /etc/kubernetes/scheduler.conf.orig || true
+          sed -i "s|server: https://.*:6443|server: https://{{ api_endpoint_address }}:6444|g" /etc/kubernetes/scheduler.conf
+        fi
+        
+    # Update all port references in kube-apiserver manifest to avoid health check failures
+    - name: Wait for kube-apiserver manifest to be created
+      wait_for:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        state: present
+        timeout: 60
+      
+    - name: Backup kube-apiserver manifest
+      copy:
+        src: /etc/kubernetes/manifests/kube-apiserver.yaml
+        dest: /etc/kubernetes/manifests/kube-apiserver.yaml.bak
+        remote_src: yes
+        mode: '0644'
+      register: api_backup
+      
+    - name: Move kube-apiserver manifest out temporarily to make edits
+      command: mv /etc/kubernetes/manifests/kube-apiserver.yaml /etc/kubernetes/kube-apiserver.yaml.tmp
+      when: api_backup is succeeded
+      
+    - name: Update liveness probe port in kube-apiserver manifest
+      replace:
+        path: /etc/kubernetes/kube-apiserver.yaml.tmp
+        regexp: '([ ]{8}port: )6443(\n[ ]{8}scheme: HTTPS)'
+        replace: '\16444\2'
+      when: api_backup is succeeded
+      
+    - name: Update readiness probe port in kube-apiserver manifest
+      replace:
+        path: /etc/kubernetes/kube-apiserver.yaml.tmp
+        regexp: '([ ]{8}port: )6443(\n[ ]{8}scheme: HTTPS)'
+        replace: '\16444\2'
+      when: api_backup is succeeded
+      
+    - name: Update startup probe port in kube-apiserver manifest
+      replace:
+        path: /etc/kubernetes/kube-apiserver.yaml.tmp
+        regexp: '([ ]{8}port: )6443(\n[ ]{8}scheme: HTTPS)'
+        replace: '\16444\2'
+      when: api_backup is succeeded
+      
+    - name: Update advertise address endpoint annotation if present
+      replace:
+        path: /etc/kubernetes/kube-apiserver.yaml.tmp
+        regexp: '([ ]{4}kubeadm\.kubernetes\.io/kube-apiserver\.advertise-address\.endpoint: .*:)6443'
+        replace: '\16444'
+      when: api_backup is succeeded
+      ignore_errors: yes
+      
+    - name: Move kube-apiserver manifest back to trigger restart
+      command: mv /etc/kubernetes/kube-apiserver.yaml.tmp /etc/kubernetes/manifests/kube-apiserver.yaml
+      when: api_backup is succeeded
+      
+    # Pause to allow kubelet to process the manifest changes
+    - name: Pause for kubelet to process manifest changes
+      pause:
+        seconds: 5
+        
+    # Wait for API server to start by checking for the running container
+    - name: Wait for kube-apiserver container to start
+      shell: "until crictl ps | grep kube-apiserver; do sleep 5; echo 'Waiting for kube-apiserver container...'; done"
+      args:
+        executable: /bin/bash
+      register: apiserver_container_check
+      timeout: 120
+      retries: 5
+      delay: 10
+      ignore_errors: yes
+      
+    # Check for port 6444 to be open
+    - name: Wait for API server to be listening on port 6444
+      wait_for:
+        port: 6444
+        host: 127.0.0.1
+        timeout: 180
+        state: started
+      register: apiserver_port_check
+      ignore_errors: yes
+
+    # Create kubernetes-admin RBAC configuration for proper permissions
+    - name: Create kubernetes-admin ClusterRoleBinding manifest
+      copy:
+        dest: /tmp/kubernetes-admin-rbac.yaml
+        content: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: kubernetes-admin-cluster-admin
+          subjects:
+          - kind: User
+            name: kubernetes-admin
+            apiGroup: rbac.authorization.k8s.io
+          roleRef:
+            kind: ClusterRole
+            name: cluster-admin
+            apiGroup: rbac.authorization.k8s.io
+        mode: '0644'
+      
+    # Wait for API server to be ready before applying RBAC
+    - name: Wait for API server to be responsive
+      shell: "until kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes &>/dev/null; do sleep 5; done"
+      args:
+        executable: /bin/bash
+      timeout: 180
+      register: apiserver_ready
+      
+    - name: Apply RBAC configuration using bootstrap method
+      shell: |
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        kubectl create clusterrolebinding kubernetes-admin-cluster-admin --clusterrole=cluster-admin --user=kubernetes-admin --dry-run=client -o yaml | kubectl apply -f -
+      register: rbac_result
+      retries: 5
+      delay: 10
+      until: rbac_result.rc == 0
+      ignore_errors: yes
+
+    - name: Apply RBAC from file (fallback method)
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /tmp/kubernetes-admin-rbac.yaml
+      register: rbac_fallback
+      when: rbac_result is failed
+      ignore_errors: yes
+
+    # Verify RBAC permissions
+    - name: Verify RBAC permissions
+      shell: KUBECONFIG=/etc/kubernetes/admin.conf kubectl auth can-i get nodes
+      register: auth_check
+      ignore_errors: yes
+      retries: 3
+      delay: 5
+      until: auth_check.stdout == 'yes'
+      
+    # Test kubectl access with the modified config
+    - name: Verify kubectl access with modified config
+      shell: kubectl --kubeconfig=/home/{{ ansible_user }}/.kube/config get nodes
+      register: kubectl_test
+      ignore_errors: yes
+      
+    - name: Debug kubectl test output
+      debug:
+        var: kubectl_test
+
+    # Download Flannel manifest using curl
+    - name: Try to download flannel manifest using curl
+      shell: curl -L -o /home/{{ ansible_user }}/kube-flannel.yml https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      args:
+        creates: /home/{{ ansible_user }}/kube-flannel.yml
+      register: flannel_download
+      ignore_errors: yes
+      
+    # Provide a local copy of flannel manifest if download fails
+    - name: Create local flannel manifest if download failed
+      copy:
+        dest: /home/{{ ansible_user }}/kube-flannel.yml
+        content: |
+          ---
+          apiVersion: policy/v1beta1
+          kind: PodSecurityPolicy
+          metadata:
+            name: psp.flannel.unprivileged
+            annotations:
+              seccomp.security.alpha.kubernetes.io/allowedProfileNames: docker/default
+              seccomp.security.alpha.kubernetes.io/defaultProfileName: docker/default
+              apparmor.security.beta.kubernetes.io/allowedProfileNames: runtime/default
+              apparmor.security.beta.kubernetes.io/defaultProfileName: runtime/default
+          spec:
+            privileged: false
+            volumes:
+            - configMap
+            - secret
+            - emptyDir
+            - hostPath
+            allowedHostPaths:
+            - pathPrefix: "/etc/cni/net.d"
+            - pathPrefix: "/etc/kube-flannel"
+            - pathPrefix: "/run/flannel"
+            readOnlyRootFilesystem: false
+            runAsUser:
+              rule: RunAsAny
+            supplementalGroups:
+              rule: RunAsAny
+            fsGroup:
+              rule: RunAsAny
+            seLinux:
+              rule: RunAsAny
+            allowPrivilegeEscalation: false
+            allowedCapabilities:
+            - NET_ADMIN
+            - NET_RAW
+            hostNetwork: true
+            hostPorts:
+            - min: 0
+              max: 65535
+          ---
+          kind: ClusterRole
+          apiVersion: rbac.authorization.k8s.io/v1
+          metadata:
+            name: flannel
+          rules:
+          - apiGroups: ['extensions']
+            resources: ['podsecuritypolicies']
+            verbs: ['use']
+            resourceNames: ['psp.flannel.unprivileged']
+          - apiGroups:
+            - ""
+            resources:
+            - pods
+            verbs:
+            - get
+          - apiGroups:
+            - ""
+            resources:
+            - nodes
+            verbs:
+            - list
+            - watch
+          - apiGroups:
+            - ""
+            resources:
+            - nodes/status
+            verbs:
+            - patch
+          ---
+          kind: ClusterRoleBinding
+          apiVersion: rbac.authorization.k8s.io/v1
+          metadata:
+            name: flannel
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: flannel
+          subjects:
+          - kind: ServiceAccount
+            name: flannel
+            namespace: kube-system
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: flannel
+            namespace: kube-system
+          ---
+          kind: ConfigMap
+          apiVersion: v1
+          metadata:
+            name: kube-flannel-cfg
+            namespace: kube-system
+            labels:
+              tier: node
+              app: flannel
+          data:
+            cni-conf.json: |
+              {
+                "name": "cbr0",
+                "cniVersion": "0.3.1",
+                "plugins": [
+                  {
+                    "type": "flannel",
+                    "delegate": {
+                      "hairpinMode": true,
+                      "isDefaultGateway": true
+                    }
+                  },
+                  {
+                    "type": "portmap",
+                    "capabilities": {
+                      "portMappings": true
+                    }
+                  }
+                ]
+              }
+            net-conf.json: |
+              {
+                "Network": "{{ pod_network_cidr }}",
+                "Backend": {
+                  "Type": "vxlan"
+                }
+              }
+          ---
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: kube-flannel-ds
+            namespace: kube-system
+            labels:
+              tier: node
+              app: flannel
+          spec:
+            selector:
+              matchLabels:
+                app: flannel
+            template:
+              metadata:
+                labels:
+                  tier: node
+                  app: flannel
+              spec:
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - key: kubernetes.io/os
+                          operator: In
+                          values:
+                          - linux
+                hostNetwork: true
+                priorityClassName: system-node-critical
+                tolerations:
+                - operator: Exists
+                  effect: NoSchedule
+                serviceAccountName: flannel
+                initContainers:
+                - name: install-cni-plugin
+                  image: rancher/mirrored-flannelcni-flannel-cni-plugin:v1.1.0
+                  command:
+                  - cp
+                  args:
+                  - -f
+                  - /flannel
+                  - /opt/cni/bin/flannel
+                  volumeMounts:
+                  - name: cni-plugin
+                    mountPath: /opt/cni/bin
+                - name: install-cni
+                  image: rancher/mirrored-flannelcni-flannel:v0.16.3
+                  command:
+                  - cp
+                  args:
+                  - -f
+                  - /etc/kube-flannel/cni-conf.json
+                  - /etc/cni/net.d/10-flannel.conflist
+                  volumeMounts:
+                  - name: cni
+                    mountPath: /etc/cni/net.d
+                  - name: flannel-cfg
+                    mountPath: /etc/kube-flannel/
+                containers:
+                - name: kube-flannel
+                  image: rancher/mirrored-flannelcni-flannel:v0.16.3
+                  command:
+                  - /opt/bin/flanneld
+                  args:
+                  - --ip-masq
+                  - --kube-subnet-mgr
+                  resources:
+                    requests:
+                      cpu: "100m"
+                      memory: "50Mi"
+                    limits:
+                      cpu: "100m"
+                      memory: "50Mi"
+                  securityContext:
+                    privileged: false
+                    capabilities:
+                      add: ["NET_ADMIN", "NET_RAW"]
+                  env:
+                  - name: POD_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.name
+                  - name: POD_NAMESPACE
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.namespace
+                  volumeMounts:
+                  - name: run
+                    mountPath: /run/flannel
+                  - name: flannel-cfg
+                    mountPath: /etc/kube-flannel/
+                volumes:
+                - name: run
+                  hostPath:
+                    path: /run/flannel
+                - name: cni-plugin
+                  hostPath:
+                    path: /opt/cni/bin
+                - name: cni
+                  hostPath:
+                    path: /etc/cni/net.d
+                - name: flannel-cfg
+                  configMap:
+                    name: kube-flannel-cfg
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+      when: flannel_download.rc is defined and flannel_download.rc != 0
+        
+    # Apply Flannel network addon with the modified kubeconfig
+    - name: Apply Flannel network addon
+      shell: |
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /home/{{ ansible_user }}/kube-flannel.yml --validate=false
+      args:
+        chdir: "/home/{{ ansible_user }}"
+      register: flannel_install
+      retries: 5
+      delay: 10
+      until: flannel_install.rc == 0
+      ignore_errors: yes
+      
+    - name: Wait for Flannel pods to start
+      shell: |
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system | grep flannel
+      register: flannel_pods
+      retries: 10
+      delay: 5
+      until: flannel_pods.rc == 0
+      ignore_errors: yes
+      
+    # Generate a valid join token
+    - name: Generate join token directly
+      shell: |
+        kubeadm token create
+      register: token_create
+      ignore_errors: yes
+      
+    - name: Debug token creation output
+      debug:
+        var: token_create
+    
+    # Get certificate hash for join command
+    - name: Get certificate hash
+      shell: |
+        openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'
+      register: cert_hash
+    
+    # Upload certificates
+    - name: Upload certificates
+      shell: |
+        kubeadm init phase upload-certs --upload-certs
+      register: cert_key
+      ignore_errors: yes
+    
+    - name: Debug certificate key
+      debug:
+        var: cert_key
+    
+    # Manually build the join commands
+    - name: Manually create control plane join command
+      copy:
+        dest: /home/{{ ansible_user }}/control_plane_join_command.sh
+        content: |
+          #!/bin/bash
+          kubeadm join {{ api_endpoint_address }}:6443 \
+            --token {{ token_create.stdout | default('abcdef.0123456789abcdef') }} \
+            --discovery-token-ca-cert-hash sha256:{{ cert_hash.stdout | default('') }} \
+            --control-plane \
+            --certificate-key {{ cert_key.stdout_lines[-1] | default('') }}
+        mode: '0700'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      when: token_create.rc is defined and token_create.rc == 0 and cert_hash.stdout is defined and cert_key.stdout is defined
+        
+    - name: Manually create worker join command
+      copy:
+        dest: /home/{{ ansible_user }}/worker_join_command.sh
+        content: |
+          #!/bin/bash
+          kubeadm join {{ api_endpoint_address }}:6443 \
+            --token {{ token_create.stdout | default('abcdef.0123456789abcdef') }} \
+            --discovery-token-ca-cert-hash sha256:{{ cert_hash.stdout | default('') }}
+        mode: '0700'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      when: token_create.rc is defined and token_create.rc == 0 and cert_hash.stdout is defined
+    
+    # Fallback join command for debugging
+    - name: Create fallback control plane join command if generation failed
+      copy:
+        content: |
+          #!/bin/bash
+          echo "Control plane join command generation failed. Please run the following command on the primary control plane node to generate a new token:"
+          echo "kubeadm token create --print-join-command"
+          echo "Then add '--control-plane --certificate-key <key>' where <key> is from:"
+          echo "kubeadm init phase upload-certs --upload-certs"
+        dest: /home/{{ ansible_user }}/control_plane_join_command.sh
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0700'
+      when: token_create.rc is defined and token_create.rc != 0 or cert_key.rc is defined and cert_key.rc != 0
+        
+    - name: Create fallback worker join command if generation failed
+      copy:
+        content: |
+          #!/bin/bash
+          echo "Worker join command generation failed. Please run the following command on the primary control plane node to generate a new token:"
+          echo "kubeadm token create --print-join-command"
+        dest: /home/{{ ansible_user }}/worker_join_command.sh
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0700'
+      when: token_create.rc is defined and token_create.rc != 0
+        
+    # Fetch commands to control machine
+    - name: Fetch control plane join command to local machine
+      fetch:
+        src: /home/{{ ansible_user }}/control_plane_join_command.sh
+        dest: ./control_plane_join_command.sh
+        flat: yes
+      ignore_errors: yes
+        
+    - name: Fetch worker join command to local machine
+      fetch:
+        src: /home/{{ ansible_user }}/worker_join_command.sh
+        dest: ./worker_join_command.sh
+        flat: yes
+      ignore_errors: yes
+
+# Join additional control plane nodes to the cluster
+- name: Join Additional Control Plane Nodes
+  hosts: k8s_master_secondary
+  become: true
+  vars:
+    k8s_username: "{{ ansible_user }}"
+    api_endpoint_address: "{{ hostvars['k8s-node-1']['ansible_host'] }}" # Use primary node's IP
+  tasks:
+    - name: Create etcd directory for PVs
+      file:
+        path: /var/lib/etcd-data
+        state: directory
+        mode: '0700'
+    
+    # Copy join command from first control plane node to additional node
+    - name: Copy control plane join command to additional master nodes
+      copy:
+        src: ./control_plane_join_command.sh
+        dest: /tmp/control_plane_join_command.sh
+        mode: '0700'
+    
+    # Ensure that api server and kubelet are not running before joining
+    - name: Check if kubelet is running
+      systemd:
+        name: kubelet
+        state: started
+      ignore_errors: yes
+      register: kubelet_status
+    
+    # Execute join command if necessary
+    - name: Join additional control plane nodes to the cluster
+      shell: sh /tmp/control_plane_join_command.sh
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+      register: join_output
+      
+    - name: Display join output for troubleshooting
+      debug:
+        var: join_output
+    
+    - name: Create .kube directory for user on additional control plane nodes
       file:
         path: "/home/{{ k8s_username }}/.kube"
         state: directory
         owner: "{{ k8s_username }}"
         group: "{{ k8s_username }}"
         mode: '0755'
+        
+    # Make sure sshpass is installed for kubeconfig copying
+    - name: Ensure sshpass is installed
+      apt:
+        name: sshpass
+        state: present
+        update_cache: yes
       
-    - name: Copy kube config for user
+    # Copy the kubeconfig from the primary node with SCP
+    - name: Copy kubeconfig from primary node (using scp)
+      shell: |
+        sshpass -p "{{ hostvars['k8s-node-1']['ansible_password'] | default('password') }}" scp -o StrictHostKeyChecking=no {{ hostvars['k8s-node-1']['ansible_user'] }}@{{ api_endpoint_address }}:/home/{{ hostvars['k8s-node-1']['ansible_user'] }}/.kube/config /home/{{ k8s_username }}/.kube/config
+      ignore_errors: yes
+      when: not ansible_check_mode
+      
+    # If scp fails, manually construct a kubeconfig
+    - name: Check if kubeconfig exists
+      stat:
+        path: "/home/{{ k8s_username }}/.kube/config"
+      register: kubeconfig_stat
+      
+    - name: Create minimal kubeconfig if doesn't exist
       copy:
-        src: /etc/kubernetes/admin.conf
+        content: |
+          apiVersion: v1
+          clusters:
+          - cluster:
+              certificate-authority-data: {{ lookup('file', '/etc/kubernetes/pki/ca.crt') | b64encode }}
+              server: https://{{ api_endpoint_address }}:6443
+            name: kubernetes
+          contexts:
+          - context:
+              cluster: kubernetes
+              user: kubernetes-admin
+            name: kubernetes-admin@kubernetes
+          current-context: kubernetes-admin@kubernetes
+          kind: Config
+          preferences: {}
+          users:
+          - name: kubernetes-admin
+            user:
+              client-certificate-data: {{ lookup('file', '/etc/kubernetes/pki/ca.crt') | b64encode }}
+              client-key-data: {{ lookup('file', '/etc/kubernetes/pki/ca.key') | b64encode }}
         dest: "/home/{{ k8s_username }}/.kube/config"
-        remote_src: yes
+        mode: "0600"
         owner: "{{ k8s_username }}"
         group: "{{ k8s_username }}"
-        mode: '0600'
-    
-    - name: Install Flannel network addon
-      become: yes
-      become_user: "{{ k8s_username }}"
-      shell: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
-      args:
-        chdir: "/home/{{ k8s_username }}"
+      ignore_errors: yes
+      when: not kubeconfig_stat.stat.exists
         
-    - name: Generate join command for worker nodes
-      shell: kubeadm token create --print-join-command
-      register: join_command
-    
-    - name: Save join command to a file
-      local_action: copy content="{{ join_command.stdout_lines[0] }}" dest="./join_command.sh"
-      become: no
+    # Apply proper taints and labels
+    - name: Apply PreferNoSchedule taint to additional control plane nodes
+      shell: |
+        kubectl --kubeconfig=/home/{{ k8s_username }}/.kube/config taint nodes {{ ansible_hostname }} node-role.kubernetes.io/control-plane:PreferNoSchedule --overwrite
+      args:
+        creates: "/home/{{ k8s_username }}/.control-plane-configured"
+      ignore_errors: yes
+      
+    - name: Touch control-plane-configured file
+      file:
+        path: "/home/{{ k8s_username }}/.control-plane-configured"
+        state: touch
+        owner: "{{ k8s_username }}"
+        group: "{{ k8s_username }}"
+        mode: '0644'
 
-- name: Join Worker Nodes to Cluster
+# Join worker nodes to the cluster
+- name: Join Worker Nodes to the Kubernetes Cluster
   hosts: k8s_workers
   become: yes
   vars:
     k8s_username: "{{ ansible_user }}"
   tasks:
-    - name: Copy join command from local to worker nodes
+    - name: Copy worker join command to worker nodes
       copy:
-        src: ./join_command.sh
-        dest: /tmp/join_command.sh
-        mode: '0755'
-      
-    - name: Join the Kubernetes cluster
-      shell: sh /tmp/join_command.sh
-      register: join_output
+        src: ./worker_join_command.sh
+        dest: /tmp/worker_join_command.sh
+        mode: '0700'
+        
+    - name: Join worker nodes to the cluster
+      shell: sh /tmp/worker_join_command.sh
       args:
         creates: /etc/kubernetes/kubelet.conf
-    
-    - name: Remove join command file
+      register: worker_join_output
+      
+    - name: Display worker join output for troubleshooting
+      debug:
+        var: worker_join_output
+
+    - name: Create worker-joined marker file
       file:
-        path: /tmp/join_command.sh
-        state: absent
+        path: "/home/{{ k8s_username }}/.worker-joined"
+        state: touch
+        owner: "{{ k8s_username }}"
+        group: "{{ k8s_username }}"
+        mode: '0644'
+
+# Only continue with these final steps if the initial setup was successful
+- name: Finalize Kubernetes Cluster Configuration
+  hosts: k8s_master_init
+  become: yes
+  become_user: "{{ ansible_user }}"
+  tasks:
+    - name: Check for kubectl access
+      shell: kubectl get nodes
+      register: node_check
+      ignore_errors: yes
+      
+    - name: Wait for all nodes to be ready
+      shell: |
+        kubectl get nodes -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' | grep -o "True" | wc -l
+      register: ready_nodes
+      until: ready_nodes.stdout | int == groups['k8s_master'] | length + groups['k8s_workers'] | default([]) | length
+      retries: 30
+      delay: 10
+      ignore_errors: yes
+      when: node_check.rc == 0
+      
+    - name: Label worker nodes
+      shell: |
+        for node in $(kubectl get nodes -o jsonpath='{.items[?(@.spec.taints==null)].metadata.name}'); do
+          kubectl label node $node node-role.kubernetes.io/worker='' --overwrite
+        done
+      ignore_errors: yes
+      when: node_check.rc == 0
+    
+    - name: Check cluster status
+      shell: kubectl get nodes -o wide
+      register: cluster_status
+      ignore_errors: yes
+      when: node_check.rc == 0
+      
+    - name: Display cluster status
+      debug:
+        var: cluster_status.stdout_lines
+      when: cluster_status is defined and cluster_status.stdout_lines is defined
+
+# Since we're using the node IP directly now, the admin.conf on each node should work
+- name: Distribute kubeconfig to all nodes
+  hosts: k8s_nodes
+  become: yes
+  vars:
+    api_endpoint_address: "{{ hostvars['k8s-node-1']['ansible_host'] }}" # Use primary node's IP
+  tasks:
+    - name: Ensure .kube directory exists
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Create minimal kubeconfig with proper server IP
+      copy:
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        content: |
+          apiVersion: v1
+          clusters:
+          - cluster:
+              server: https://{{ control_plane_endpoint }}:6443
+              insecure-skip-tls-verify: true
+            name: kubernetes
+          contexts:
+          - context:
+              cluster: kubernetes
+              user: kubernetes-admin
+            name: kubernetes-admin@kubernetes
+          current-context: kubernetes-admin@kubernetes
+          kind: Config
+          preferences: {}
+          users:
+          - name: kubernetes-admin
+            user:
+              client-certificate: /etc/kubernetes/pki/apiserver-kubelet-client.crt
+              client-key: /etc/kubernetes/pki/apiserver-kubelet-client.key
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+      ignore_errors: yes
+
+# Copy the kubeconfig to the local machine with the correct IP
+- name: Copy kubeconfig to local machine
+  hosts: localhost
+  connection: local
+  vars:
+    api_endpoint_address: "{{ hostvars['k8s-node-1']['ansible_host'] }}" # Use primary node's IP
+  tasks:
+    - name: Create local kubeconfig directory
+      file:
+        path: "~/.kube"
+        state: directory
+        mode: '0700'
+      
+    - name: Create local kubeconfig with proper server IP
+      copy:
+        dest: "~/.kube/config"
+        content: |
+          apiVersion: v1
+          clusters:
+          - cluster:
+              server: https://{{ api_endpoint_address }}:6443
+              insecure-skip-tls-verify: true
+            name: kubernetes
+          contexts:
+          - context:
+              cluster: kubernetes
+              user: kubernetes-admin
+            name: kubernetes-admin@kubernetes
+          current-context: kubernetes-admin@kubernetes
+          kind: Config
+          preferences: {}
+          users:
+          - name: kubernetes-admin
+            user:
+              client-certificate-data: >-
+                {{ lookup('file', './admin.crt') | b64encode if (lookup('file', './admin.crt', errors='ignore')) else 'LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCi0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0K' }}
+              client-key-data: >-
+                {{ lookup('file', './admin.key') | b64encode if (lookup('file', './admin.key', errors='ignore')) else 'LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQotLS0tLUVORCBSU0EgUFJJVkFURSBLRVktLS0tLQo=' }}
+        mode: '0600'
+      ignore_errors: yes

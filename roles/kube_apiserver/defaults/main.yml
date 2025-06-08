@@ -1,0 +1,13 @@
+---
+# Default variables for kube_apiserver role
+
+# API Server optimization settings
+apiserver_max_requests_inflight: 200
+apiserver_max_mutating_requests_inflight: 100
+apiserver_request_timeout: 300s
+
+# Security settings
+apiserver_enable_admission_plugins: "NodeRestriction,PodSecurity"
+
+# HA configuration
+apiserver_cluster_endpoint: "{{ control_plane_endpoint }}:{{ control_plane_endpoint_port | default('6443') }}"

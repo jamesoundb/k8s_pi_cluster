@@ -1,0 +1,6 @@
+---
+# Handlers for kube-proxy role
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: yes

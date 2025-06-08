@@ -1,0 +1,494 @@
+---
+# CNI Network Plugin Installation Playbook
+# This playbook handles the installation of Flannel CNI after the first control plane node is ready
+# Run this after first-control-plane.yml has successfully completed
+
+- name: Install Flannel CNI Network Plugin
+  hosts: k8s_master_init
+  become: true
+  vars:
+    pod_network_cidr: "10.244.0.0/16"
+    k8s_username: "{{ ansible_user }}"
+    api_endpoint_address: "{{ ansible_host }}"  # Use the actual node IP for direct connection
+  
+  tasks:
+    # First verify that we have a running API server with proper authentication
+    - name: Check if admin.conf exists
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf_stat
+    
+    - name: Display admin.conf status
+      debug:
+        msg: "admin.conf exists: {{ admin_conf_stat.stat.exists }}"
+    
+    - name: Fail if admin.conf is missing
+      fail:
+        msg: "Error: /etc/kubernetes/admin.conf is missing. The Kubernetes API server may not have initialized properly."
+      when: not admin_conf_stat.stat.exists
+    
+    # Create kubeconfig directory for the user if needed
+    - name: Ensure .kube directory exists
+      file:
+        path: "/home/{{ k8s_username }}/.kube"
+        state: directory
+        owner: "{{ k8s_username }}"
+        group: "{{ k8s_username }}"
+        mode: '0755'
+      
+    - name: Copy admin.conf to user's kubeconfig if needed
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ k8s_username }}/.kube/config"
+        remote_src: yes
+        owner: "{{ k8s_username }}"
+        group: "{{ k8s_username }}"
+        mode: '0600'
+      when: admin_conf_stat.stat.exists
+    
+    # Wait for API server to be ready
+    - name: Wait for API server to be ready
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes
+      register: api_ready
+      retries: 10
+      delay: 5
+      until: api_ready.rc == 0
+      ignore_errors: true
+    
+    - name: Display API server readiness status
+      debug:
+        msg: "API server is ready: {{ api_ready.rc == 0 }}"
+        
+    # Check if kube-apiserver.yaml exists, if not restore from backup
+    - name: Check if kube-apiserver manifest exists
+      stat:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+      register: api_manifest_stat
+    
+    - name: Check if kube-apiserver backup exists
+      stat:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml.bak
+      register: api_backup_stat
+      when: not api_manifest_stat.stat.exists
+    
+    - name: Restore kube-apiserver manifest from backup if needed
+      copy:
+        src: /etc/kubernetes/manifests/kube-apiserver.yaml.bak
+        dest: /etc/kubernetes/manifests/kube-apiserver.yaml
+        remote_src: yes
+        mode: '0644'
+      when: not api_manifest_stat.stat.exists and api_backup_stat.stat.exists
+      register: restored_api_manifest
+    
+    - name: Wait for API server to restart after restoring manifest
+      pause:
+        seconds: 30
+      when: restored_api_manifest is changed
+    
+    # Ensure consistent port configuration in Kubernetes components
+    - name: Verify API server is configured correctly
+      shell: "grep -o 'secure-port=6444' /etc/kubernetes/manifests/kube-apiserver.yaml || echo 'not-configured'"
+      register: api_port_check
+      ignore_errors: true
+      
+    - name: Analyze API server port configuration
+      debug:
+        msg: "API server port configuration: {{ 'Correct (6444)' if 'secure-port=6444' in api_port_check.stdout else 'Incorrect (not set to 6444)' }}"
+
+    # Update API server manifest if needed
+    - name: Backup kube-apiserver manifest
+      copy:
+        src: /etc/kubernetes/manifests/kube-apiserver.yaml
+        dest: /etc/kubernetes/manifests/kube-apiserver.yaml.bak
+        remote_src: yes
+        mode: '0644'
+      
+    - name: Move kube-apiserver manifest out temporarily to make edits
+      command: mv /etc/kubernetes/manifests/kube-apiserver.yaml /etc/kubernetes/kube-apiserver.yaml.tmp
+      
+    # Fix the malformed t44 lines in annotations
+    - name: Fix malformed annotations in API server manifest
+      replace:
+        path: /etc/kubernetes/kube-apiserver.yaml.tmp
+        regexp: '  annotations:\nt44'
+        replace: '  annotations:'
+      
+    # Fix the malformed t44 lines in livenessProbe
+    - name: Fix malformed livenessProbe in API server manifest
+      replace:
+        path: /etc/kubernetes/kube-apiserver.yaml.tmp
+        regexp: '        path: /livez\nt44\n        scheme: HTTPS'
+        replace: '        path: /livez\n        port: 6444\n        scheme: HTTPS'
+      
+    # Fix the malformed t44 lines in readinessProbe
+    - name: Fix malformed readinessProbe in API server manifest
+      replace:
+        path: /etc/kubernetes/kube-apiserver.yaml.tmp
+        regexp: '        path: /readyz\nt44\n        scheme: HTTPS'
+        replace: '        path: /readyz\n        port: 6444\n        scheme: HTTPS'
+      
+    # Fix the malformed t44 lines in startupProbe
+    - name: Fix malformed startupProbe in API server manifest
+      replace:
+        path: /etc/kubernetes/kube-apiserver.yaml.tmp
+        regexp: '        path: /livez\nt44\n        scheme: HTTPS'
+        replace: '        path: /livez\n        port: 6444\n        scheme: HTTPS'
+      
+    - name: Update API server secure port in manifest (if needed)
+      replace:
+        path: /etc/kubernetes/kube-apiserver.yaml.tmp
+        regexp: '--secure-port=6443'
+        replace: '--secure-port=6444'
+      ignore_errors: true
+      
+    - name: Move kube-apiserver manifest back to trigger restart
+      command: mv /etc/kubernetes/kube-apiserver.yaml.tmp /etc/kubernetes/manifests/kube-apiserver.yaml
+      when: api_port_check.stdout == 'not-configured'
+      
+    # Check and update all kubeconfig files
+    - name: Gather all kubeconfig files
+      find:
+        paths: /etc/kubernetes
+        patterns: "*.conf"
+      register: kubeconfig_files
+
+    - name: Check each kubeconfig file
+      shell: "grep -o 'server: https://.*:6443' {{ item.path }} || echo 'correctly-configured'"
+      register: kubeconfig_checks
+      with_items: "{{ kubeconfig_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+      ignore_errors: true
+      
+    - name: Update kubeconfig files that use incorrect port
+      replace:
+        path: "{{ item.item.path }}"
+        regexp: 'server: https://.*:6443'
+        replace: 'server: https://{{ api_endpoint_address }}:6444'
+      with_items: "{{ kubeconfig_checks.results }}"
+      when: item.stdout != 'correctly-configured'
+      loop_control:
+        label: "{{ item.item.path }}"
+      register: kubeconfig_updates
+
+    # Also check and update the user's kubeconfig
+    - name: Check user kubeconfig
+      stat:
+        path: "/home/{{ k8s_username }}/.kube/config"
+      register: user_kubeconfig
+    
+    - name: Update user kubeconfig if it exists
+      replace:
+        path: "/home/{{ k8s_username }}/.kube/config"
+        regexp: 'server: https://.*:6443'
+        replace: 'server: https://{{ api_endpoint_address }}:6444'
+      when: user_kubeconfig.stat.exists
+      register: user_kubeconfig_updated
+
+    # Restart kubelet if any kubeconfig files were updated
+    - name: Restart kubelet to pick up configuration changes
+      systemd:
+        name: kubelet
+        state: restarted
+      when: kubeconfig_updates is changed or user_kubeconfig_updated is changed
+      
+    # Download Flannel manifest
+    - name: Create temporary directory for CNI manifests
+      file:
+        path: /tmp/flannel
+        state: directory
+        mode: '0755'
+    
+    - name: Download Flannel manifest using curl
+      shell: curl -L -o /tmp/flannel/kube-flannel.yml https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      args:
+        creates: /tmp/flannel/kube-flannel.yml
+      register: flannel_download
+      ignore_errors: true
+      
+    # Check if flannel manifest exists after download attempt
+    - name: Check if flannel manifest file exists
+      stat:
+        path: /tmp/flannel/kube-flannel.yml
+      register: flannel_file
+
+    # Fallback if download fails
+    - name: Create Flannel manifest from template if download failed
+      copy:
+        dest: /tmp/flannel/kube-flannel.yml
+        content: |
+          ---
+          kind: Namespace
+          apiVersion: v1
+          metadata:
+            name: kube-flannel
+            labels:
+              pod-security.kubernetes.io/enforce: privileged
+          ---
+          kind: ClusterRole
+          apiVersion: rbac.authorization.k8s.io/v1
+          metadata:
+            name: flannel
+          rules:
+          - apiGroups:
+              - ""
+            resources:
+              - pods
+            verbs:
+              - get
+          - apiGroups:
+              - ""
+            resources:
+              - nodes
+            verbs:
+              - list
+              - watch
+          - apiGroups:
+              - ""
+            resources:
+              - nodes/status
+            verbs:
+              - patch
+          ---
+          kind: ClusterRoleBinding
+          apiVersion: rbac.authorization.k8s.io/v1
+          metadata:
+            name: flannel
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: flannel
+          subjects:
+          - kind: ServiceAccount
+            name: flannel
+            namespace: kube-flannel
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: flannel
+            namespace: kube-flannel
+          ---
+          kind: ConfigMap
+          apiVersion: v1
+          metadata:
+            name: kube-flannel-cfg
+            namespace: kube-flannel
+            labels:
+              tier: node
+              app: flannel
+          data:
+            cni-conf.json: |
+              {
+                "name": "cbr0",
+                "cniVersion": "0.3.1",
+                "plugins": [
+                  {
+                    "type": "flannel",
+                    "delegate": {
+                      "hairpinMode": true,
+                      "isDefaultGateway": true
+                    }
+                  },
+                  {
+                    "type": "portmap",
+                    "capabilities": {
+                      "portMappings": true
+                    }
+                  }
+                ]
+              }
+            net-conf.json: |
+              {
+                "Network": "{{ pod_network_cidr }}",
+                "Backend": {
+                  "Type": "vxlan"
+                }
+              }
+          ---
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: kube-flannel-ds
+            namespace: kube-flannel
+            labels:
+              tier: node
+              app: flannel
+          spec:
+            selector:
+              matchLabels:
+                app: flannel
+            template:
+              metadata:
+                labels:
+                  tier: node
+                  app: flannel
+              spec:
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - key: kubernetes.io/os
+                          operator: In
+                          values:
+                          - linux
+                hostNetwork: true
+                tolerations:
+                - operator: Exists
+                  effect: NoSchedule
+                # Add specific tolerations for control plane nodes
+                - key: node-role.kubernetes.io/control-plane
+                  operator: Exists
+                  effect: NoSchedule
+                - key: node-role.kubernetes.io/master
+                  operator: Exists
+                  effect: NoSchedule
+                serviceAccountName: flannel
+                initContainers:
+                - name: install-cni-plugin
+                  image: docker.io/flannel/flannel-cni-plugin:v1.1.2
+                  command:
+                  - cp
+                  args:
+                  - -f
+                  - /flannel
+                  - /opt/cni/bin/flannel
+                  volumeMounts:
+                  - name: cni-plugin
+                    mountPath: /opt/cni/bin
+                - name: install-cni
+                  image: docker.io/flannel/flannel:v0.22.0
+                  command:
+                  - cp
+                  args:
+                  - -f
+                  - /etc/kube-flannel/cni-conf.json
+                  - /etc/cni/net.d/10-flannel.conflist
+                  volumeMounts:
+                  - name: cni
+                    mountPath: /etc/cni/net.d
+                  - name: flannel-cfg
+                    mountPath: /etc/kube-flannel/
+                containers:
+                - name: kube-flannel
+                  image: docker.io/flannel/flannel:v0.22.0
+                  command:
+                  - /opt/bin/flanneld
+                  args:
+                  - --ip-masq
+                  - --kube-subnet-mgr
+                  - --iface=eth0
+                  resources:
+                    requests:
+                      cpu: "100m"
+                      memory: "50Mi"
+                    limits:
+                      cpu: "100m"
+                      memory: "50Mi"
+                  securityContext:
+                    privileged: false
+                    capabilities:
+                      add: ["NET_ADMIN", "NET_RAW"]
+                  env:
+                  - name: POD_NAME
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.name
+                  - name: POD_NAMESPACE
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: metadata.namespace
+                  - name: EVENT_QUEUE_DEPTH
+                    value: "5000"
+                  volumeMounts:
+                  - name: run
+                    mountPath: /run/flannel
+                  - name: flannel-cfg
+                    mountPath: /etc/kube-flannel/
+                  - name: xtables-lock
+                    mountPath: /run/xtables.lock
+                volumes:
+                - name: run
+                  hostPath:
+                    path: /run/flannel
+                - name: cni-plugin
+                  hostPath:
+                    path: /opt/cni/bin
+                - name: cni
+                  hostPath:
+                    path: /etc/cni/net.d
+                - name: flannel-cfg
+                  configMap:
+                    name: kube-flannel-cfg
+                - name: xtables-lock
+                  hostPath:
+                    path: /run/xtables.lock
+                    type: FileOrCreate
+        owner: root
+        group: root
+        mode: '0644'
+      when: flannel_download is failed
+    
+    # Apply network configuration
+    - name: Apply Flannel network configuration
+      become: true
+      become_user: "{{ k8s_username }}"
+      shell: kubectl --kubeconfig=/home/{{ k8s_username }}/.kube/config apply -f /tmp/flannel/kube-flannel.yml
+      register: flannel_apply
+      retries: 5
+      delay: 10
+      until: flannel_apply.rc == 0
+      ignore_errors: true
+    
+    - name: Display Flannel installation status
+      debug:
+        var: flannel_apply
+        verbosity: 1
+
+    # Wait for Flannel pods to be ready
+    - name: Wait for Flannel pods to start
+      become: true
+      become_user: "{{ k8s_username }}"
+      shell: kubectl --kubeconfig=/home/{{ k8s_username }}/.kube/config get pods -n kube-flannel -o wide
+      register: flannel_pods
+      retries: 10
+      delay: 5
+      until: "'Running' in flannel_pods.stdout"
+      ignore_errors: true
+      
+    - name: Display Flannel pods status
+      debug:
+        var: flannel_pods.stdout_lines
+    
+    # Verify network functionality
+    - name: Check node network status
+      become: true
+      become_user: "{{ k8s_username }}"
+      shell: kubectl --kubeconfig=/home/{{ k8s_username }}/.kube/config get nodes -o wide
+      register: nodes_status
+      
+    - name: Display node network status
+      debug:
+        var: nodes_status.stdout_lines
+
+    # Install CNI plugins if needed
+    - name: Ensure CNI plugins directory exists
+      file:
+        path: /opt/cni/bin
+        state: directory
+        mode: '0755'
+
+    - name: Check if CNI plugins are installed
+      stat:
+        path: /opt/cni/bin/flannel
+      register: flannel_plugin
+    
+    - name: Install CNI plugins if missing
+      shell: |
+        if [ ! -f /opt/cni/bin/flannel ]; then
+          mkdir -p /opt/cni/bin
+          curl -L https://github.com/containernetworking/plugins/releases/download/v1.2.0/cni-plugins-linux-{{ 'arm64' if ansible_architecture == 'aarch64' else ansible_architecture }}-v1.2.0.tgz | tar -C /opt/cni/bin -xz
+        fi
+      when: not flannel_plugin.stat.exists
+      ignore_errors: true

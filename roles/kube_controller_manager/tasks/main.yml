@@ -1,0 +1,31 @@
+---
+# kube_controller_manager role - Kubernetes Controller Manager configuration
+
+- name: Create kube-controller-manager service directory
+  file:
+    path: /etc/systemd/system/kube-controller-manager.service.d
+    state: directory
+    mode: '0755'
+
+# On the first control plane node (init node)
+- name: Initialize Kubernetes controller manager on first control plane node
+  block:
+    - name: Generate controller manager kubeconfig (init phase)
+      shell: kubeadm init phase kubeconfig controller-manager
+      args:
+        creates: /etc/kubernetes/controller-manager.conf
+  when: inventory_hostname == groups['k8s_master_init'][0]
+
+# For all control plane nodes
+- name: Optimize controller manager for resource-constrained environment
+  copy:
+    dest: /etc/systemd/system/kube-controller-manager.service.d/10-performance.conf
+    content: |
+      [Service]
+      Environment="KUBE_CONTROLLER_MANAGER_ARGS=--concurrent-deployment-syncs=2 --concurrent-endpoint-syncs=2 --concurrent-service-syncs=1 --concurrent-rc-syncs=2 --concurrent-replicaset-syncs=2"
+    mode: '0644'
+  notify: Reload systemd
+  when: inventory_hostname in groups['k8s_master']
+
+# Note: Secondary control plane node joining is handled in the join-control-plane.yml playbook
+# after the first control plane node is fully initialized and operational

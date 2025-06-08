@@ -1,0 +1,111 @@
+---
+# Fix Control Plane Nodes Playbook
+# This playbook replicates the functionality of fix-control-plane-join.sh
+# Run with: ansible-playbook -i inventory.yml playbooks/fix-control-plane.yml -e "target_nodes=k8s-node-2,k8s-node-3"
+
+- name: Reset specified control plane nodes
+  hosts: "{{ target_nodes.split(',') }}"
+  become: true
+  tasks:
+    - name: Stop kubelet service
+      systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: true
+
+    - name: Perform kubeadm reset
+      command: kubeadm reset --force
+      
+    - name: Clean up CNI configuration
+      file:
+        path: /etc/cni/net.d/
+        state: absent
+        
+    - name: Remove cni0 network interface
+      command: ip link delete cni0
+      ignore_errors: true
+      changed_when: false
+      
+    - name: Remove flannel.1 network interface
+      command: ip link delete flannel.1
+      ignore_errors: true
+      changed_when: false
+
+- name: Generate join artifacts on first control plane node
+  hosts: k8s_master_init
+  become: true
+  tasks:
+    - name: Delete existing certificate secret if present
+      shell: >
+        kubectl -n kube-system get secret kubeadm-certs &>/dev/null && 
+        kubectl -n kube-system delete secret kubeadm-certs || 
+        echo "No existing certs to delete"
+      changed_when: true
+
+    - name: Upload fresh certificates to cluster
+      shell: kubeadm init phase upload-certs --upload-certs | grep -v '\[' | tail -1
+      register: cert_key_output
+      
+    - name: Create bootstrap token
+      shell: kubeadm token create --print-join-command | grep -o '[a-z0-9]\{6\}\.[a-z0-9]\{16\}'
+      register: token_output
+      
+    - name: Get CA hash
+      shell: >
+        openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | 
+        openssl rsa -pubin -outform der 2>/dev/null | 
+        openssl dgst -sha256 -hex | sed 's/^.* //'
+      register: ca_hash_output
+
+    - name: Get control plane IP
+      shell: kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'
+      register: master_ip_output
+      
+    - name: Set join command fact
+      set_fact:
+        join_command: >
+          kubeadm join {{ master_ip_output.stdout }}:6443 
+          --token {{ token_output.stdout }} 
+          --discovery-token-ca-cert-hash sha256:{{ ca_hash_output.stdout }} 
+          --control-plane 
+          --certificate-key {{ cert_key_output.stdout }} 
+          --ignore-preflight-errors=Port-10250
+
+    - name: Store join command
+      local_action:
+        module: copy
+        content: "{{ join_command }}"
+        dest: "/home/james/k8s_stuff/k8s_pi_cluster/control_plane_join_command.sh"
+        mode: "0600"
+      become: false
+
+- name: Join nodes to the cluster
+  hosts: "{{ target_nodes.split(',') }}"
+  become: true
+  vars:
+    max_attempts: 10
+    delay_seconds: 10
+  tasks:
+    - name: Get join command
+      local_action: command cat /home/james/k8s_stuff/k8s_pi_cluster/control_plane_join_command.sh
+      register: join_cmd
+      become: false
+      changed_when: false
+      
+    - name: Run join command
+      command: "{{ join_cmd.stdout }}"
+      
+    - name: Wait for node to become ready
+      shell: kubectl get nodes | grep "{{ inventory_hostname }}" | grep "Ready"
+      delegate_to: "{{ groups['k8s_master_init'][0] }}"
+      register: node_ready
+      until: node_ready.rc == 0
+      retries: "{{ max_attempts }}"
+      delay: "{{ delay_seconds }}"
+      ignore_errors: true
+      changed_when: false
+      
+    - name: Check if node joined successfully
+      fail:
+        msg: "Node {{ inventory_hostname }} did not become ready within the timeout period"
+      when: node_ready.rc != 0

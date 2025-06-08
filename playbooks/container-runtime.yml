@@ -1,0 +1,92 @@
+---
+# Container Runtime Setup Playbook - Extracted from k8s-setup.yml
+# Configures containerd as the container runtime for Kubernetes
+
+- name: Configure Container Runtime
+  hosts: k8s_nodes
+  become: true
+  vars:
+    k8s_username: "{{ ansible_user }}"
+  
+  tasks:
+    - name: Install containerd package
+      apt:
+        name: containerd
+        state: present
+        update_cache: yes
+    
+    - name: Ensure containerd directory exists
+      file:
+        path: /etc/containerd
+        state: directory
+    
+    - name: Configure containerd to use systemd cgroup driver
+      shell: |
+        containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+        sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+    
+    - name: Configure containerd for optimal Raspberry Pi / ARM performance
+      copy:
+        dest: /etc/containerd/config.toml
+        content: |
+          version = 2
+          [plugins]
+            [plugins."io.containerd.grpc.v1.cri"]
+              sandbox_image = "registry.k8s.io/pause:3.9"
+              [plugins."io.containerd.grpc.v1.cri".containerd]
+                snapshotter = "overlayfs"
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                    runtime_type = "io.containerd.runc.v2"
+                    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                      SystemdCgroup = true
+                      NoPivotRoot = false
+                      IoUid = 0
+                      IoGid = 0
+                      BinaryName = ""
+                      Root = ""
+                      ShimCgroup = ""
+                      CriuImagePath = ""
+                      CriuWorkPath = ""
+          [metrics]
+            address = ""
+            grpc_histogram = false
+      notify: restart containerd
+    
+    - name: Enable and start containerd service
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+    
+    - name: Create kubelet service directory for configuration
+      file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: '0755'
+    
+    - name: Configure kubelet resources appropriately for hardware
+      copy:
+        dest: /etc/systemd/system/kubelet.service.d/10-kubelet.conf
+        content: |
+          [Service]
+          Environment="KUBELET_EXTRA_ARGS=--eviction-hard=memory.available<500Mi,nodefs.available<10%,nodefs.inodesFree<5% --system-reserved=memory=200Mi,cpu=200m --kube-reserved=memory=300Mi,cpu=300m"
+        mode: '0644'
+      register: kubelet_config
+    
+    # Only enable kubelet but don't start it - will be started by kubeadm
+    - name: Enable kubelet service (but don't start it yet)
+      systemd:
+        name: kubelet
+        enabled: yes
+        daemon_reload: yes
+      when: kubelet_config is changed
+
+  handlers:
+    - name: restart containerd
+      systemd:
+        name: containerd
+        state: restarted

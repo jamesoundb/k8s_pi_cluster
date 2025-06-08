@@ -1,0 +1,22 @@
+---
+# Global variables for Kubernetes cluster
+
+# Kubernetes version
+k8s_version: "1.29.0"
+
+# Network configurations
+pod_network_cidr: "10.244.0.0/16"
+service_network_cidr: "10.245.0.0/16"
+
+# Control plane endpoint (Virtual IP for HA)
+control_plane_endpoint: "192.168.1.100"
+control_plane_endpoint_port: "6443"
+
+# Cluster configuration
+cluster_name: "pi-k8s-cluster"
+
+# CNI plugin (calico, flannel, etc)
+cni_plugin: "flannel"
+
+# Container runtime
+container_runtime: "containerd"

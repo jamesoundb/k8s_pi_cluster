@@ -1,0 +1,80 @@
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+nodeRegistration:
+  name: {{ inventory_hostname }}
+  criSocket: "unix:///var/run/containerd/containerd.sock"
+bootstrapTokens:
+- groups:
+  - system:bootstrappers:kubeadm:default-node-token
+  ttl: 24h0m0s
+  usages:
+  - signing
+  - authentication
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: v{{ k8s_version }}
+controlPlaneEndpoint: "{{ control_plane_endpoint }}:{{ control_plane_endpoint_port | default('6443') }}"
+networking:
+  podSubnet: {{ pod_network_cidr }}
+  serviceSubnet: {{ service_network_cidr | default('10.245.0.0/16') }}
+apiServer:
+  extraArgs:
+    enable-admission-plugins: "{{ apiserver_enable_admission_plugins }}"
+    max-requests-inflight: "{{ apiserver_max_requests_inflight }}"
+    max-mutating-requests-inflight: "{{ apiserver_max_mutating_requests_inflight }}"
+    request-timeout: "{{ apiserver_request_timeout }}"
+    etcd-cafile: /etc/kubernetes/pki/etcd/ca.crt
+    etcd-certfile: /etc/kubernetes/pki/apiserver-etcd-client.crt
+    etcd-keyfile: /etc/kubernetes/pki/apiserver-etcd-client.key
+    etcd-servers: "https://127.0.0.1:2379"
+    bind-address: "0.0.0.0"
+    advertise-address: "{{ ansible_host }}"
+    secure-port: "6444"
+    event-ttl: "1h"
+    kubelet-preferred-address-types: "InternalIP,ExternalIP,Hostname"
+    service-node-port-range: "30000-32767"
+    tls-cipher-suites: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+    feature-gates: "APIPriorityAndFairness=true"
+    allow-privileged: "true"
+    min-request-timeout: "300"
+    shutdown-delay-duration: "30s"
+    default-not-ready-toleration-seconds: "60"
+    default-unreachable-toleration-seconds: "60"
+  timeoutForControlPlane: 8m0s
+etcd:
+  local:
+    dataDir: "/var/lib/etcd"
+    extraArgs:
+      cert-file: /etc/kubernetes/pki/etcd/server.crt
+      key-file: /etc/kubernetes/pki/etcd/server.key
+      peer-cert-file: /etc/kubernetes/pki/etcd/peer.crt
+      peer-key-file: /etc/kubernetes/pki/etcd/peer.key
+      initial-cluster: "{{ inventory_hostname }}=https://{{ ansible_default_ipv4.address }}:2380"
+      initial-advertise-peer-urls: "https://{{ ansible_default_ipv4.address }}:2380"
+      initial-cluster-state: new
+      name: "{{ inventory_hostname }}"
+      listen-peer-urls: "https://{{ ansible_host }}:2380"
+      listen-client-urls: "https://{{ ansible_host }}:2379,https://127.0.0.1:2379"
+      advertise-client-urls: "https://{{ ansible_host }}:2379"
+      trusted-ca-file: /etc/kubernetes/pki/etcd/ca.crt
+      peer-trusted-ca-file: /etc/kubernetes/pki/etcd/ca.crt
+      peer-client-cert-auth: "true"
+      client-cert-auth: "true"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+authentication:
+  anonymous:
+    enabled: false
+  webhook:
+    enabled: true
+  x509:
+    clientCAFile: /etc/kubernetes/pki/ca.crt
+authorization:
+  mode: Webhook
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: "ipvs"

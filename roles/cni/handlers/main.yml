@@ -1,0 +1,7 @@
+---
+# Handlers for CNI role
+
+- name: Restart Keepalived
+  systemd:
+    name: keepalived
+    state: restarted

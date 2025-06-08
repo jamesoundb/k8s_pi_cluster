@@ -1,0 +1,49 @@
+---
+# kubelet role - Kubernetes node agent configuration
+
+- name: Create kubelet config directory
+  file:
+    path: /etc/systemd/system/kubelet.service.d
+    state: directory
+    mode: '0755'
+
+- name: Configure kubelet resources for Raspberry Pi
+  copy:
+    dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+    content: |
+      [Service]
+      Environment="KUBELET_EXTRA_ARGS=--eviction-hard={{ arm_resource_settings.eviction_hard }} --system-reserved={{ arm_resource_settings.system_reserved }} --kube-reserved={{ arm_resource_settings.kube_reserved }} {{ control_plane_kubelet_extra_args if inventory_hostname in groups['k8s_master'] else worker_kubelet_extra_args }}"
+    mode: '0644'
+  when: "'arm' in ansible_architecture"
+  notify: Restart kubelet
+
+- name: Configure kubelet resources for x86 nodes
+  copy:
+    dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+    content: |
+      [Service]
+      Environment="KUBELET_EXTRA_ARGS=--eviction-hard={{ x86_resource_settings.eviction_hard }} --system-reserved={{ x86_resource_settings.system_reserved }} --kube-reserved={{ x86_resource_settings.kube_reserved }} {{ control_plane_kubelet_extra_args if inventory_hostname in groups['k8s_master'] else worker_kubelet_extra_args }}"
+    mode: '0644'
+  when: "'arm' not in ansible_architecture"
+  notify: Restart kubelet
+
+# Enable kubelet but don't start it (kubeadm will handle this)
+- name: Enable kubelet service
+  systemd:
+    name: kubelet
+    enabled: yes
+    state: stopped
+
+# For worker nodes to join the cluster
+- name: Get worker join command
+  shell: kubeadm token create --print-join-command
+  register: worker_join_command_raw
+  delegate_to: "{{ groups['k8s_master_init'][0] }}"
+  run_once: true
+  when: inventory_hostname in groups['k8s_workers']
+
+- name: Join worker nodes to the cluster
+  shell: "{{ hostvars[groups['k8s_master_init'][0]]['worker_join_command_raw'].stdout }}"
+  args:
+    creates: /etc/kubernetes/kubelet.conf
+  when: inventory_hostname in groups['k8s_workers']

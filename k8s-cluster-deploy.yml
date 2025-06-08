@@ -1,0 +1,198 @@
+---
+# Consolidated Kubernetes Cluster Deployment Playbook
+
+# [0] OS Preparation
+- name: Prepare OS for Kubernetes
+  hosts: k8s_nodes
+  become: yes
+  roles:
+    - common
+
+# [1] Container Runtime
+- name: Install and configure container runtime
+  hosts: k8s_nodes
+  become: yes
+  roles:
+    - containerd
+
+# [2] etcd Cluster (first to establish data store)
+- name: Deploy etcd for control plane
+  hosts: k8s_master_init
+  become: yes
+  roles:
+    - etcd
+
+# [3] Load Balancer Configuration (to establish VIP)
+- name: Configure Load Balancing with Virtual IP
+  hosts: k8s_master
+  become: yes
+  tasks:
+    - name: Verify API server prerequisites are met
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      register: api_server_prereqs
+      loop:
+        - /etc/kubernetes/pki/etcd/ca.crt
+        - /etc/kubernetes/pki/etcd/server.key
+        - /etc/kubernetes/pki/etcd/server.crt
+      
+    - name: Display API server prerequisites status
+      ansible.builtin.debug:
+        msg: "API server prerequisites: {{ api_server_prereqs.results | map(attribute='stat.exists') | list }}"
+      
+    - name: Ensure API server prerequisite directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/kubernetes/pki
+        - /etc/kubernetes/pki/etcd
+      when: api_server_prereqs.results | map(attribute='stat.exists') | select('equalto', false) | list | length > 0
+
+    # Keepalived setup continues
+    - name: Install Keepalived
+      ansible.builtin.apt:
+        name: keepalived
+        state: present
+        update_cache: yes
+      
+    - name: Configure Keepalived
+      ansible.builtin.template:
+        src: roles/cni/templates/keepalived.conf.j2
+        dest: /etc/keepalived/keepalived.conf
+        owner: root
+        group: root
+        mode: '0644'
+      
+    - name: Enable and start Keepalived service
+      ansible.builtin.systemd:
+        name: keepalived
+        state: restarted
+        enabled: yes
+
+# [4] kube-apiserver and cluster initialization
+- name: Deploy Kubernetes API server and initialize cluster
+  hosts: k8s_master_init
+  become: yes
+  roles:
+    - kube_apiserver
+
+# [5] Wait for first control plane node to be ready
+- name: Wait for first control plane node
+  hosts: k8s_master_init
+  become: yes
+  tasks:
+    - name: Check if kubeconfig exists
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubeconfig_stat
+
+    - name: Wait for kubeconfig to be created if not present
+      wait_for:
+        path: /etc/kubernetes/admin.conf
+        state: present
+        timeout: 300
+      when: not kubeconfig_stat.stat.exists
+
+    - name: Wait for API server to be ready
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw='/readyz' || echo "not ready"
+      register: api_ready
+      until: api_ready.stdout == "ok"
+      retries: 30
+      delay: 10
+      
+    - name: Display API server readiness status
+      debug:
+        msg: "API server is ready: {{ api_ready.stdout == 'ok' }}"
+
+# [5.5] Setup RBAC permissions
+- name: Setup RBAC permissions for kubeadmin
+  import_playbook: playbooks/create-rbac.yml
+
+# [6] Deploy CNI after API server is available
+- name: Deploy CNI network plugin
+  hosts: k8s_master_init
+  become: yes
+  tasks:
+    - name: Check if admin.conf exists
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf_stat
+      
+    - name: Display admin.conf status
+      debug:
+        msg: "admin.conf exists: {{ admin_conf_stat.stat.exists }}"
+        
+    - name: Fail if admin.conf is missing
+      fail:
+        msg: "Error: /etc/kubernetes/admin.conf is missing. The Kubernetes API server may not have initialized properly."
+      when: not admin_conf_stat.stat.exists
+      
+    - name: Create CNI directory
+      file:
+        path: /tmp/flannel
+        state: directory
+        mode: '0755'
+
+    - name: Download Flannel manifest
+      get_url:
+        url: https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+        dest: /tmp/flannel/kube-flannel.yml
+        mode: '0644'
+
+    - name: Apply Flannel manifest
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /tmp/flannel/kube-flannel.yml
+      register: flannel_result
+      retries: 3
+      delay: 10
+      until: flannel_result.rc == 0
+      ignore_errors: yes
+
+    - name: Wait for Flannel pods to be ready
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-flannel -o wide
+      register: flannel_pods
+      retries: 10
+      delay: 10
+      until: "'Running' in flannel_pods.stdout"
+      ignore_errors: yes
+
+# [7] Join additional control plane nodes
+- name: Join additional control plane nodes
+  import_playbook: playbooks/join-control-plane.yml
+
+# [8] kube-controller-manager
+- name: Deploy Kubernetes controller manager
+  hosts: k8s_master
+  become: yes
+  roles:
+    - kube_controller_manager
+
+# [9] kube-scheduler
+- name: Deploy Kubernetes scheduler
+  hosts: k8s_master
+  become: yes
+  roles:
+    - kube_scheduler
+
+# [7] kubelet
+- name: Deploy kubelet on all nodes
+  hosts: k8s_nodes
+  become: yes
+  roles:
+    - kubelet
+
+# [8] kube-proxy
+- name: Deploy kube-proxy on all nodes
+  hosts: k8s_nodes
+  become: yes
+  roles:
+    - kube_proxy
+
+# Post-installation tasks
+- name: Post-installation configuration
+  import_playbook: playbooks/post-install.yml
+
+# Verify control plane status
+- name: Verify all API servers are operational
+  import_playbook: playbooks/verify-control-plane.yml

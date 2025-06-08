@@ -1,0 +1,55 @@
+---
+# main-k8s-deploy.yml - Consolidated Kubernetes Deployment Playbook
+# This playbook orchestrates the entire Kubernetes cluster deployment process
+# in the correct order, with clear dependencies between stages.
+
+# Pre-flight check to validate hosts and network connectivity
+- name: Pre-flight checks
+  hosts: all
+  gather_facts: yes
+  tasks:
+    - name: Ping all hosts to verify connectivity
+      ping:
+        
+    - name: Show host info
+      debug:
+        msg: "Host: {{ inventory_hostname }}, IP: {{ ansible_host }}, OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+# 1. OS Preparation (from k8s-setup.yml)
+- name: Operating System Preparation
+  import_playbook: playbooks/os-prep.yml
+
+# 2. Container Runtime Setup (from k8s-setup.yml)
+- name: Configure Container Runtime
+  import_playbook: playbooks/container-runtime.yml
+
+# 3. Network Infrastructure Setup (HAProxy, Keepalived)
+- name: Configure Network Infrastructure
+  import_playbook: playbooks/network-infra.yml
+
+# 4. First Control Plane Bootstrap (from k8s-cluster-init.yml)
+# This is the critical step to initialize the first control plane node
+- name: Bootstrap First Control Plane Node
+  import_playbook: playbooks/first-control-plane.yml
+
+# 4.5 Ensure consistent port configuration across all components
+# This fixes issues with kubelet not being able to connect to the API server
+- name: Ensure port configuration consistency
+  import_playbook: playbooks/port-configuration.yml
+
+# 5. Deploy CNI Network Plugin (from k8s-cluster-deploy.yml)
+# Once the API server is online, we can deploy the CNI plugin
+- name: Deploy CNI Network Plugin
+  import_playbook: playbooks/cni-plugin.yml
+
+# 6. Join Additional Control Plane Nodes
+- name: Join Additional Control Plane Nodes
+  import_playbook: playbooks/additional-control-planes.yml
+
+# 7. Join Worker Nodes
+- name: Join Worker Nodes
+  import_playbook: playbooks/worker-setup.yml
+
+# 8. Post-installation Verification and Configuration
+- name: Post-installation Tasks and Verification
+  import_playbook: playbooks/post-config.yml

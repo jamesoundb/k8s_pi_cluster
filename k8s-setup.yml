@@ -1,9 +1,9 @@
 ---
-- name: Kubernetes Cluster Setup
+- name: Kubernetes Control Plane Setup
   hosts: k8s_nodes
   become: yes
   vars:
-    k8s_version: "1.29"
+    k8s_version: "1.29.0"
     k8s_username: "{{ ansible_user }}"
   
   tasks:
@@ -155,7 +155,230 @@
         autoremove: yes
         autoclean: yes
       register: apt_upgrade
-        
+    
+    # Lightweight server optimization tasks
+    - name: Remove unnecessary packages
+      apt:
+        name:
+          - snapd
+          - cloud-init-standard  # Keep only minimal cloud-init
+          - landscape-common
+          - ubuntu-advantage-tools
+          - lxd-agent-loader
+          - plymouth
+          - apport
+          - popularity-contest
+          - whoopsie
+          - unattended-upgrades
+          - motd-news-config
+        state: absent
+        purge: yes
+        autoremove: yes
+      
+    - name: Disable unnecessary services
+      systemd:
+        name: "{{ item }}"
+        enabled: no
+        state: stopped
+      with_items:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+        - fstrim.timer
+        - motd-news.timer
+        - man-db.timer
+        - logrotate.timer
+        - grub-common.service
+        - pollinate.service
+        - systemd-tmpfiles-clean.timer
+      ignore_errors: yes
+    
+    - name: Clean up journal logs
+      command: journalctl --vacuum-time=1d
+      changed_when: true
+    
+    - name: Set systemd journal max size
+      copy:
+        dest: /etc/systemd/journald.conf
+        content: |
+          [Journal]
+          SystemMaxUse=100M
+          SystemMaxFileSize=20M
+          MaxRetentionSec=1day
+    
+    - name: Reduce swappiness
+      sysctl:
+        name: vm.swappiness
+        value: '1'
+        state: present
+    
+    # Raspberry Pi specific performance optimizations
+    - name: Create kubelet config directory
+      file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: '0755'
+    
+    - name: Configure kubelet resources for control plane
+      copy:
+        dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+        content: |
+          [Service]
+          Environment="KUBELET_EXTRA_ARGS=--eviction-hard=memory.available<500Mi,nodefs.available<10%,nodefs.inodesFree<5% --system-reserved=memory=200Mi,cpu=200m --kube-reserved=memory=300Mi,cpu=300m"
+
+    # Only enable kubelet but don't start it - will be started by kubeadm
+    - name: Enable kubelet service (but don't start it yet)
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: stopped
+
+    - name: Add {{ k8s_username }} to docker group
+      user:
+        name: "{{ k8s_username }}"
+        groups: docker
+        append: yes
+    
+    - name: Create GPU memory split configuration for Pi
+      lineinfile:
+        path: /boot/firmware/config.txt
+        line: "{{ item }}"
+        create: yes
+      with_items:
+        - "# Limit GPU memory to provide more RAM to the system"
+        - "gpu_mem=16"
+      when: "'arm' in ansible_architecture"
+    
+    # Control plane specific optimizations
+    - name: Create etcd service directory
+      file:
+        path: /etc/systemd/system/etcd.service.d
+        state: directory
+        mode: '0755'
+      when: inventory_hostname in groups['k8s_master']
+    
+    - name: Apply etcd performance optimizations
+      copy:
+        dest: /etc/systemd/system/etcd.service.d/10-performance.conf
+        content: |
+          [Service]
+          Environment="ETCD_SNAPSHOT_COUNT=5000"
+          Environment="ETCD_HEARTBEAT_INTERVAL=100"
+          Environment="ETCD_ELECTION_TIMEOUT=1000"
+        mode: '0644'
+      when: inventory_hostname in groups['k8s_master']
+      
+    - name: Create kube-apiserver service directory
+      file:
+        path: /etc/systemd/system/kube-apiserver.service.d
+        state: directory
+        mode: '0755'
+      when: inventory_hostname in groups['k8s_master']
+      
+    - name: Optimize API Server for small control plane
+      copy:
+        dest: /etc/systemd/system/kube-apiserver.service.d/10-performance.conf
+        content: |
+          [Service]
+          Environment="KUBE_API_ARGS=--max-requests-inflight=200 --max-mutating-requests-inflight=100 --request-timeout=300s"
+        mode: '0644'
+      when: inventory_hostname in groups['k8s_master']
+      
+    - name: Set up automatic etcd backups
+      cron:
+        name: "backup etcd"
+        minute: "0"
+        hour: "*/6"
+        job: "mkdir -p /home/{{ k8s_username }}/etcd-backups && ETCDCTL_API=3 etcdctl --endpoints=localhost:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key snapshot save /home/{{ k8s_username }}/etcd-backups/etcd-snapshot-$(date +%Y%m%d-%H%M).db && find /home/{{ k8s_username }}/etcd-backups -type f -mtime +7 -delete"
+      when: inventory_hostname in groups['k8s_master']
+    
+    - name: Optimize kernel parameters for container workloads
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_file: /etc/sysctl.d/99-kubernetes-performance.conf
+      with_items:
+        - { name: 'kernel.panic', value: '10' }
+        - { name: 'kernel.panic_on_oops', value: '1' }
+        - { name: 'vm.overcommit_memory', value: '1' }
+        - { name: 'vm.panic_on_oom', value: '0' }
+        - { name: 'net.ipv4.tcp_slow_start_after_idle', value: '0' }
+        - { name: 'net.core.somaxconn', value: '32768' }
+        - { name: 'net.ipv4.tcp_max_syn_backlog', value: '8096' }
+        - { name: 'fs.inotify.max_user_watches', value: '524288' }
+        - { name: 'fs.file-max', value: '1000000' }
+    
+    - name: Configure containerd to use lower resource settings
+      shell: |
+        cat > /etc/containerd/config.toml << EOF
+        version = 2
+        [plugins]
+          [plugins."io.containerd.grpc.v1.cri"]
+            sandbox_image = "registry.k8s.io/pause:3.9"
+            [plugins."io.containerd.grpc.v1.cri".containerd]
+              snapshotter = "overlayfs"
+              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                  runtime_type = "io.containerd.runc.v2"
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                    SystemdCgroup = true
+                    NoPivotRoot = false
+                    IoUid = 0
+                    IoGid = 0
+                    BinaryName = ""
+                    Root = ""
+                    ShimCgroup = ""
+                    CriuImagePath = ""
+                    CriuWorkPath = ""
+        [metrics]
+          address = ""
+          grpc_histogram = false
+        EOF
+      args:
+        creates: /etc/containerd/config.toml
+    
+    - name: Install useful monitoring tools
+      apt:
+        name:
+          - htop
+          - iotop
+          - iftop
+          - atop
+        state: present
+    
+    - name: Install Keepalived
+      apt:
+        name: keepalived
+        state: present
+
+    - name: Configure Keepalived
+      copy:
+        dest: /etc/keepalived/keepalived.conf
+        content: |
+          vrrp_instance VI_1 {
+              state MASTER
+              interface eth0
+              virtual_router_id 51
+              priority 100
+              advert_int 1
+              authentication {
+                  auth_type PASS
+                  auth_pass 12345
+              }
+              virtual_ipaddress {
+                  192.168.1.100
+              }
+          }
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Restart Keepalived
+      systemd:
+        name: keepalived
+        state: restarted
+        enabled: yes
+    
     - name: Reboot nodes
       reboot:
         msg: "Rebooting after system updates"

@@ -1,0 +1,752 @@
+---
+# kube_apiserver role - Kubernetes API Server configuration
+
+- name: Create kube-apiserver service directory
+  file:
+    path: /etc/kubernetes
+    state: directory
+    mode: '0755'
+    
+# Include HAProxy configuration tasks
+- name: Configure HAProxy for API server load balancing
+  include_tasks: haproxy.yml
+  when: inventory_hostname == groups['k8s_master_init'][0]
+
+- name: Install Kubernetes APT key
+  shell: curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+- name: Create keyring directory
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+- name: Add Kubernetes repository
+  apt_repository:
+    repo: deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /
+    state: present
+    filename: kubernetes
+
+- name: Update apt cache
+  apt:
+    update_cache: yes
+
+- name: Install Kubernetes components
+  apt:
+    name:
+      - kubelet
+      - kubeadm
+      - kubectl
+    state: present
+
+- name: Hold Kubernetes packages
+  dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+
+# Generate API server client certificates for etcd
+- name: Generate API server client certificate for etcd
+  block:
+    - name: Generate apiserver-etcd-client private key
+      shell: openssl genrsa -out /etc/kubernetes/pki/apiserver-etcd-client.key 2048
+      args:
+        creates: /etc/kubernetes/pki/apiserver-etcd-client.key
+
+    - name: Create API server etcd client certificate config
+      copy:
+        dest: /etc/kubernetes/pki/apiserver-etcd-client-csr.conf
+        content: |
+          [req]
+          req_extensions = v3_req
+          distinguished_name = req_distinguished_name
+          [req_distinguished_name]
+          [ v3_req ]
+          basicConstraints = CA:FALSE
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = clientAuth
+        mode: '0644'
+
+    - name: Generate API server etcd client CSR
+      shell: openssl req -new -key /etc/kubernetes/pki/apiserver-etcd-client.key -subj "/CN=kube-apiserver-etcd-client/O=system:masters" -config /etc/kubernetes/pki/apiserver-etcd-client-csr.conf -out /etc/kubernetes/pki/apiserver-etcd-client.csr
+      args:
+        creates: /etc/kubernetes/pki/apiserver-etcd-client.csr
+
+    - name: Sign API server etcd client certificate
+      shell: openssl x509 -req -in /etc/kubernetes/pki/apiserver-etcd-client.csr -CA /etc/kubernetes/pki/etcd/ca.crt -CAkey /etc/kubernetes/pki/etcd/ca.key -CAcreateserial -out /etc/kubernetes/pki/apiserver-etcd-client.crt -days 10000 -extensions v3_req -extfile /etc/kubernetes/pki/apiserver-etcd-client-csr.conf
+      args:
+        creates: /etc/kubernetes/pki/apiserver-etcd-client.crt
+  when: inventory_hostname == groups['k8s_master_init'][0]
+
+# Initialize Kubernetes control plane on first node
+- name: Initialize Kubernetes control plane on first node
+  block:
+    # First verify all required certificates exist
+    - name: Verify etcd certificates exist
+      stat:
+        path: "/etc/kubernetes/pki/etcd/{{ item }}"
+      register: etcd_certs_check
+      loop:
+        - ca.crt
+        - server.crt
+        - server.key
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Fail if etcd certificates are missing
+      fail:
+        msg: "Required etcd certificates are missing. Please ensure etcd role has run first."
+      when: 
+        - inventory_hostname == groups['k8s_master_init'][0]
+        - not etcd_certs_check.results | selectattr('stat.exists', 'equalto', true) | list | length == 3
+
+    - name: Create kubeadm config directory
+      file:
+        path: /etc/kubernetes/kubeadm
+        state: directory
+        mode: '0755'
+        
+    - name: Create kubeadm init configuration for first control plane node
+      template:
+        src: kubeadm-init.yaml.j2
+        dest: /etc/kubernetes/kubeadm/kubeadm-init.yaml
+        mode: '0644'
+      
+    - name: Initialize Kubernetes cluster with kubeadm
+      command: kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-init.yaml --upload-certs
+      args:
+        creates: /etc/kubernetes/admin.conf
+      register: kubeadm_init_result
+      
+    - name: Display kubeadm init output
+      debug:
+        var: kubeadm_init_result.stdout_lines
+      when: kubeadm_init_result.changed
+
+    # Debug kubelet status before checking API server
+    - name: Check kubelet status
+      shell: systemctl status kubelet
+      register: kubelet_status
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display kubelet status
+      debug:
+        var: kubelet_status.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and kubelet_status.stdout_lines is defined
+    
+    # Check kubelet logs for errors
+    - name: Check kubelet logs
+      shell: journalctl -xeu kubelet --no-pager -n 50
+      register: kubelet_logs
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display kubelet logs
+      debug:
+        var: kubelet_logs.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and kubelet_logs.stdout_lines is defined
+    
+    # Check for required kernel modules
+    - name: Verify kernel modules for Kubernetes
+      shell: lsmod | grep -E 'br_netfilter|overlay'
+      register: kernel_modules
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display kernel module status
+      debug:
+        var: kernel_modules.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and kernel_modules.stdout_lines is defined
+      
+    # Check and fix containerd socket issues
+    - name: Verify containerd socket exists
+      stat:
+        path: /run/containerd/containerd.sock
+      register: containerd_socket
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display containerd socket status
+      debug:
+        msg: "Containerd socket exists: {{ containerd_socket.stat.exists | default(false) }}"
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Check containerd service status
+      shell: systemctl status containerd
+      register: containerd_status
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display containerd service status
+      debug:
+        var: containerd_status.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and containerd_status.stdout_lines is defined
+      
+    - name: Check containerd logs for errors
+      shell: journalctl -xeu containerd --no-pager -n 50
+      register: containerd_logs
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display containerd logs
+      debug:
+        var: containerd_logs.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and containerd_logs.stdout_lines is defined
+      
+    - name: Check containerd configuration
+      shell: cat /etc/containerd/config.toml
+      register: containerd_config
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display containerd configuration
+      debug:
+        var: containerd_config.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and containerd_config.stdout_lines is defined
+      
+    - name: Fix containerd configuration - ensure using systemd cgroup driver
+      copy:
+        dest: /etc/containerd/config.toml
+        content: |
+          version = 2
+          [plugins]
+            [plugins."io.containerd.grpc.v1.cri"]
+              sandbox_image = "registry.k8s.io/pause:3.9"
+              [plugins."io.containerd.grpc.v1.cri".containerd]
+                snapshotter = "overlayfs"
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                    runtime_type = "io.containerd.runc.v2"
+                    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                      SystemdCgroup = true
+          [metrics]
+            address = "127.0.0.1:1338"
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      register: containerd_config_fixed
+      
+    - name: Stop kubelet before restarting containerd
+      systemd:
+        name: kubelet
+        state: stopped
+      when: inventory_hostname == groups['k8s_master_init'][0] and (containerd_config_fixed.changed or not containerd_socket.stat.exists | default(false))
+      
+    - name: Restart containerd service
+      systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: yes
+      when: inventory_hostname == groups['k8s_master_init'][0] and (containerd_config_fixed.changed or not containerd_socket.stat.exists | default(false))
+      
+    - name: Wait for containerd socket to be created after restart
+      wait_for:
+        path: /run/containerd/containerd.sock
+        delay: 5
+        timeout: 30
+      when: inventory_hostname == groups['k8s_master_init'][0] and (containerd_config_fixed.changed or not containerd_socket.stat.exists | default(false))
+      
+    - name: Check containerd socket after restart
+      stat:
+        path: /run/containerd/containerd.sock
+      register: containerd_socket_after
+      when: inventory_hostname == groups['k8s_master_init'][0] and (containerd_config_fixed.changed or not containerd_socket.stat.exists | default(false))
+      
+    - name: Display containerd socket status after restart
+      debug:
+        msg: "Containerd socket exists after restart: {{ containerd_socket_after.stat.exists | default(false) }}"
+      when: inventory_hostname == groups['k8s_master_init'][0] and containerd_socket_after is defined
+      
+    - name: Verify containerd socket permissions
+      file:
+        path: /run/containerd/containerd.sock
+        mode: '0660'
+      when: inventory_hostname == groups['k8s_master_init'][0] and (containerd_socket.stat.exists | default(false) or containerd_socket_after.stat.exists | default(false))
+
+    # Check API server manifest
+    - name: Check if API server manifest exists
+      stat:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+      register: apiserver_manifest
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    # Examine API Server manifest if it exists
+    - name: Display API server manifest status
+      debug:
+        msg: "API server manifest exists: {{ apiserver_manifest.stat.exists | default(false) }}"
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Examine API Server manifest content
+      shell: cat /etc/kubernetes/manifests/kube-apiserver.yaml || echo "File not found"
+      register: apiserver_manifest_content
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display API server manifest content
+      debug:
+        var: apiserver_manifest_content.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and apiserver_manifest_content.stdout_lines is defined
+      
+    - name: Check for static pod directory and permissions
+      shell: ls -la /etc/kubernetes/manifests/ /var/lib/kubelet/pods/ 2>/dev/null || echo "Directory not found"
+      register: pod_dirs
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display pod directory contents
+      debug:
+        var: pod_dirs.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and pod_dirs.stdout_lines is defined
+
+    # Force restart kubelet to reload static pod manifests
+    # Check kubelet configuration to confirm it's using containerd
+    - name: Check kubelet configuration for container runtime
+      shell: grep -r "container-runtime\|containerRuntime" /etc/kubernetes/kubelet.conf /var/lib/kubelet/config.yaml /etc/systemd/system/kubelet.service.d/*.conf 2>/dev/null || echo "Container runtime config not found"
+      register: kubelet_container_config
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    - name: Display kubelet container runtime configuration
+      debug:
+        var: kubelet_container_config.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and kubelet_container_config.stdout_lines is defined
+
+    # Reset failed state if kubelet is in failed state
+    - name: Reset failed status for kubelet if it's in failed state
+      shell: systemctl reset-failed kubelet || true
+      changed_when: false
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    # Create or update crictl configuration file to ensure it's pointing at the right socket
+    - name: Create crictl configuration file
+      copy:
+        dest: /etc/crictl.yaml
+        content: |
+          runtime-endpoint: unix:///run/containerd/containerd.sock
+          image-endpoint: unix:///run/containerd/containerd.sock
+          timeout: 10
+          debug: false
+        mode: '0644'
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    # Generate kubeadm init configuration
+    - name: Create directory for kubeadm configuration
+      file:
+        path: /etc/kubernetes/kubeadm
+        state: directory
+        mode: '0755'
+      when: inventory_hostname == groups['k8s_master_init'][0]
+    
+    - name: Generate kubeadm init configuration
+      template:
+        src: kubeadm-init.yaml.j2
+        dest: /etc/kubernetes/kubeadm/kubeadm-init.yaml
+        mode: '0600'
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    # Ensure kubeadm config directory exists
+    - name: Create kubeadm config directory
+      file:
+        path: /etc/kubernetes/kubeadm
+        state: directory
+        mode: '0755'
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    # Generate kubeadm config before using it
+    - name: Generate kubeadm configuration file
+      template:
+        src: kubeadm-init.yaml.j2
+        dest: /etc/kubernetes/kubeadm/kubeadm-init.yaml
+        mode: '0600'
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      register: kubeadm_config_generated
+
+    # Verify kubeadm config was created successfully  
+    - name: Verify kubeadm configuration file exists
+      stat:
+        path: /etc/kubernetes/kubeadm/kubeadm-init.yaml
+      register: kubeadm_config_exists
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    - name: Fail if kubeadm configuration file was not created
+      fail:
+        msg: "Failed to create kubeadm configuration file"
+      when: 
+        - inventory_hostname == groups['k8s_master_init'][0]
+        - not kubeadm_config_exists.stat.exists
+    
+    # Run kubeadm init to initialize the control plane
+    - name: Initialize Kubernetes control plane with kubeadm
+      shell: kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-init.yaml --upload-certs --v=5
+      register: kubeadm_init
+      failed_when: 
+        - kubeadm_init.rc != 0
+        - "'already exists' not in kubeadm_init.stderr"
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display kubeadm init output
+      debug:
+        var: kubeadm_init.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and kubeadm_init.stdout_lines is defined
+      
+    - name: Display kubeadm init errors (if any)
+      debug:
+        var: kubeadm_init.stderr_lines
+      when: 
+        - inventory_hostname == groups['k8s_master_init'][0] 
+        - kubeadm_init.stderr_lines is defined
+        - kubeadm_init.stderr_lines | length > 0
+
+    # Ensure kubelet systemd drop-in directory exists
+    - name: Ensure kubelet systemd drop-in directory exists
+      file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: '0755'
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    # Configure kubelet with all required arguments
+    - name: Configure kubelet
+      copy:
+        dest: /etc/systemd/system/kubelet.service.d/10-kubelet.conf
+        content: |
+          [Service]
+          Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock --pod-manifest-path=/etc/kubernetes/manifests --kubeconfig=/etc/kubernetes/kubelet.conf --eviction-hard=memory.available<500Mi,nodefs.available<10%,nodefs.inodesFree<5% --system-reserved=memory=200Mi,cpu=200m --kube-reserved=memory=300Mi,cpu=300m"
+        mode: '0644'
+      register: kubelet_config
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Remove old containerd config
+      file:
+        path: /etc/systemd/system/kubelet.service.d/20-containerd.conf
+        state: absent
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    - name: Ensure static pod directory exists with proper permissions
+      file:
+        path: /etc/kubernetes/manifests
+        state: directory
+        mode: '0755'
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    # Reload systemd and restart kubelet if configuration was changed
+    - name: Reload systemd after kubelet configuration changes
+      shell: systemctl daemon-reload
+      when: inventory_hostname == groups['k8s_master_init'][0] and kubelet_config.changed
+
+    # Restart kubelet to apply configuration changes
+    - name: Restart kubelet service to reload manifests and apply configuration changes
+      systemd:
+        name: kubelet
+        state: restarted
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    # Check if cluster is already initialized by looking for admin.conf
+    - name: Check if Kubernetes cluster is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    # Only try to reinitialize if the first attempt failed and admin.conf doesn't exist
+    - name: Attempt to reinitialize Kubernetes control plane (only if needed)
+      block:
+        - name: Copy kubeadm config to temporary location
+          copy:
+            src: /etc/kubernetes/kubeadm/kubeadm-init.yaml
+            dest: /tmp/kubeadm-init.yaml
+            remote_src: yes
+            mode: '0600'
+          
+        - name: Reinitialize Kubernetes control plane with kubeadm
+          shell: kubeadm init --config=/tmp/kubeadm-init.yaml --upload-certs --ignore-preflight-errors=all --v=5
+          register: kubeadm_reinit
+          failed_when: false
+          
+        - name: Display kubeadm reinit output (if executed)
+          debug:
+            var: kubeadm_reinit.stdout_lines
+          when: kubeadm_reinit.stdout_lines is defined
+      when: 
+        - inventory_hostname == groups['k8s_master_init'][0]
+        - (kubeadm_init.rc != 0 or kubeadm_init is failed)
+        - not admin_conf.stat.exists
+      
+    - name: Display kubeadm init output
+      debug:
+        var: kubeadm_init.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and kubeadm_init.stdout_lines is defined
+      
+    # Wait for static pods to start up
+    - name: Wait for static pods directory to be populated
+      pause:
+        seconds: 30
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    # Verify that kubelet can communicate with containerd
+    - name: Check if kubelet can communicate with containerd
+      shell: crictl --runtime-endpoint=unix:///run/containerd/containerd.sock ps || echo "Failed to communicate with containerd"
+      register: crictl_check
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    - name: Display containerd connectivity status
+      debug:
+        var: crictl_check.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and crictl_check.stdout_lines is defined
+      
+    # Check if kubelet is actually watching the manifests directory
+    - name: Verify static pod directory configuration in kubelet
+      shell: grep -r "staticPodPath\|--pod-manifest-path" /etc/kubernetes/kubelet.conf /var/lib/kubelet/config.yaml 2>/dev/null || echo "Config not found"
+      register: kubelet_manifest_config
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display kubelet static pod configuration
+      debug:
+        var: kubelet_manifest_config.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and kubelet_manifest_config.stdout_lines is defined
+      
+    # Check for API server port listening
+    - name: Check if API server port is listening
+      shell: netstat -tulpn | grep 6443 || ss -tulpn | grep 6443 || echo "API server port not found"
+      register: api_port_check
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display API server port status
+      debug:
+        var: api_port_check.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    # Check kube-apiserver process
+    - name: Check if kube-apiserver process is running
+      shell: ps aux | grep kube-apiserver | grep -v grep || echo "API server process not found"
+      register: api_process_check
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display API server process status
+      debug:
+        var: api_process_check.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0]
+            
+    - name: Wait for API server to become available
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw='/healthz'
+      register: api_status
+      until: api_status.stdout == "ok"
+      retries: 7
+      delay: 10
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display API server connectivity status
+      debug:
+        var: api_status
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    # Fix API server issues if needed
+    - name: Check static pod manifests
+      shell: ls -la /etc/kubernetes/manifests/
+      register: manifests_status
+      changed_when: false
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+    
+    - name: Display pod manifests status
+      debug: 
+        var: manifests_status.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and manifests_status.stdout_lines is defined
+      
+    # Initialize RBAC before CNI deployment
+    - name: Create cluster-admin ClusterRoleBinding for kubernetes-admin user
+      shell: |
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf create clusterrolebinding cluster-admin-binding \
+          --clusterrole=cluster-admin \
+          --user=kubernetes-admin || true
+      register: rbac_init
+      changed_when: "'created' in rbac_init.stdout"
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    - name: Ensure admin.conf has correct permissions
+      file:
+        path: /etc/kubernetes/admin.conf
+        mode: '0644'
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    # Wait for RBAC to be ready before continuing
+    - name: Wait for RBAC to be ready
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf auth can-i '*' '*' --all-namespaces
+      register: rbac_ready
+      until: rbac_ready.rc == 0
+      retries: 6
+      delay: 10
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    # Apply CNI regardless of API server status
+    - name: Apply Flannel CNI immediately after cluster init
+      shell: |
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      register: flannel_apply
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    - name: Display CNI apply result
+      debug:
+        var: flannel_apply.stdout_lines
+      when: inventory_hostname == groups['k8s_master_init'][0] and flannel_apply.changed
+
+    - name: Create .kube directory for user
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+      
+    - name: Copy kubeconfig to user home directory
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+        remote_src: yes
+
+    # Ensure API server is fully ready before generating tokens
+    - name: Wait for API server to be fully ready
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw='/readyz'
+      register: api_ready
+      until: api_ready.stdout == "ok"
+      retries: 30
+      delay: 10
+      when: inventory_hostname == groups['k8s_master_init'][0]
+
+    - name: Wait for all control plane components to be running
+      shell: |
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system -l tier=control-plane -o jsonpath='{.items[*].status.phase}' | grep -v Running
+      register: control_plane_ready
+      until: control_plane_ready.rc == 1
+      retries: 30
+      delay: 10
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      
+    # Original join command tasks follow
+    - name: Store join command for additional control plane nodes
+      shell: kubeadm token create --print-join-command
+      register: join_command
+      changed_when: false
+
+    - name: Generate certificate key for control plane join
+      shell: kubeadm init phase upload-certs --upload-certs | tail -n 1
+      register: cert_key
+      changed_when: false
+    
+    - name: Set facts for join command
+      set_fact:
+        control_plane_join_command: "{{ join_command.stdout }} --control-plane --certificate-key {{ cert_key.stdout }}"
+      
+  when: inventory_hostname == groups['k8s_master_init'][0]
+
+# Generate API server client certificates for etcd
+- name: Generate API server client certificate for etcd
+  block:
+    - name: Generate apiserver-etcd-client private key
+      shell: openssl genrsa -out /etc/kubernetes/pki/apiserver-etcd-client.key 2048
+      args:
+        creates: /etc/kubernetes/pki/apiserver-etcd-client.key
+
+    - name: Create API server etcd client certificate config
+      copy:
+        dest: /etc/kubernetes/pki/apiserver-etcd-client-csr.conf
+        content: |
+          [req]
+          req_extensions = v3_req
+          distinguished_name = req_distinguished_name
+          [req_distinguished_name]
+          [ v3_req ]
+          basicConstraints = CA:FALSE
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = clientAuth
+        mode: '0644'
+
+    - name: Generate API server etcd client CSR
+      shell: openssl req -new -key /etc/kubernetes/pki/apiserver-etcd-client.key -subj "/CN=kube-apiserver-etcd-client/O=system:masters" -config /etc/kubernetes/pki/apiserver-etcd-client-csr.conf -out /etc/kubernetes/pki/apiserver-etcd-client.csr
+      args:
+        creates: /etc/kubernetes/pki/apiserver-etcd-client.csr
+
+    - name: Sign API server etcd client certificate
+      shell: openssl x509 -req -in /etc/kubernetes/pki/apiserver-etcd-client.csr -CA /etc/kubernetes/pki/etcd/ca.crt -CAkey /etc/kubernetes/pki/etcd/ca.key -CAcreateserial -out /etc/kubernetes/pki/apiserver-etcd-client.crt -days 10000 -extensions v3_req -extfile /etc/kubernetes/pki/apiserver-etcd-client-csr.conf
+      args:
+        creates: /etc/kubernetes/pki/apiserver-etcd-client.crt
+  when: inventory_hostname == groups['k8s_master_init'][0]
+
+# Add pre-flight check for etcd client certificates
+- name: Verify API server etcd client certificates exist
+  stat:
+    path: "/etc/kubernetes/pki/{{ item }}"
+  register: api_etcd_certs_check
+  loop:
+    - apiserver-etcd-client.crt
+    - apiserver-etcd-client.key
+  when: inventory_hostname == groups['k8s_master_init'][0]
+
+- name: Fail if API server etcd client certificates are missing
+  fail:
+    msg: "Required API server etcd client certificates are missing."
+  when:
+    - inventory_hostname == groups['k8s_master_init'][0]
+    - not api_etcd_certs_check.results | selectattr('stat.exists', 'equalto', true) | list | length == 2
+
+# Optimize API Server for small control plane
+- name: Create kube-apiserver service directory
+  file:
+    path: /etc/systemd/system/kube-apiserver.service.d
+    state: directory
+    mode: '0755'
+
+- name: Optimize API Server performance settings
+  copy:
+    dest: /etc/systemd/system/kube-apiserver.service.d/10-performance.conf
+    content: |
+      [Service]
+      Environment="KUBE_API_ARGS=--max-requests-inflight={{ apiserver_max_requests_inflight }} --max-mutating-requests-inflight={{ apiserver_max_mutating_requests_inflight }} --request-timeout={{ apiserver_request_timeout }}"
+    mode: '0644'
+  notify: Reload systemd
+
+# HAProxy configuration for load balancing
+- name: Install and configure HAProxy for API server load balancing
+  block:
+    - name: Install HAProxy
+      apt:
+        name: haproxy
+        state: present
+        
+    - name: Configure HAProxy for Kubernetes API server
+      template:
+        src: haproxy.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+        mode: '0644'
+      notify: Restart HAProxy
+      
+    - name: Ensure HAProxy is started and enabled
+      systemd:
+        name: haproxy
+        state: started
+        enabled: yes
+  when: inventory_hostname in groups['k8s_master']

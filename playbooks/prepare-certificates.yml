@@ -1,0 +1,81 @@
+---
+# Playbook to prepare certificates and tokens for joining a control plane node
+# Usage: ansible-playbook -i inventory.yml playbooks/prepare-certificates.yml -e "target_node=k8s-node-2"
+
+- name: Prepare certificates and tokens for joining
+  hosts: k8s_master_init
+  become: true
+  gather_facts: true
+  vars:
+    cert_output_file: "/tmp/k8s_join_data.txt"
+  tasks:
+    - name: Verify target node is defined
+      fail:
+        msg: "Please specify a target node with -e 'target_node=hostname'"
+      when: target_node is not defined
+
+    - name: Remove existing certificate secrets if present
+      shell: |
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get secret -n kube-system kubeadm-certs &>/dev/null && \
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf delete secret -n kube-system kubeadm-certs || \
+        echo "No existing certs to delete"
+      register: delete_result
+
+    - name: Display delete result
+      debug:
+        var: delete_result.stdout_lines
+        verbosity: 1
+
+    - name: Wait for deletion to complete
+      pause:
+        seconds: 5
+
+    - name: Generate new certificate key
+      shell: |
+        # Reset any existing certificate state
+        kubeadm reset phase upload-certs 2>/dev/null || true
+            
+        # Generate a fresh key and upload certificates
+        CERT_KEY=$(openssl rand -hex 32)
+        echo "CERTIFICATE_KEY:$CERT_KEY" > {{ cert_output_file }}
+            
+        # Use the verbose flag to ensure proper certificate upload
+        kubeadm init phase upload-certs --upload-certs --certificate-key=$CERT_KEY --v=5
+            
+        # Wait briefly for the secret to be fully available
+        sleep 2
+            
+        # Verify the secret exists in the kube-system namespace
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get secret -n kube-system kubeadm-certs
+      register: cert_key_output
+
+    - name: Display certificate generation output
+      debug:
+        var: cert_key_output.stdout_lines
+        verbosity: 1
+
+    - name: Create bootstrap token
+      shell: |
+        TOKEN=$(kubeadm token create --ttl 2h)
+        echo "BOOTSTRAP_TOKEN:$TOKEN" >> {{ cert_output_file }}
+      register: token_output
+
+    - name: Get CA certificate hash
+      shell: |
+        CA_HASH=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')
+        echo "CA_HASH:$CA_HASH" >> {{ cert_output_file }}
+      register: ca_hash_output
+
+    - name: Create join command in file
+      shell: |
+        echo "JOIN_COMMAND:kubeadm join 192.168.1.100:6443 --token $(grep BOOTSTRAP_TOKEN {{ cert_output_file }} | cut -d':' -f2) --discovery-token-ca-cert-hash sha256:$(grep CA_HASH {{ cert_output_file }} | cut -d':' -f2) --control-plane --certificate-key $(grep CERTIFICATE_KEY {{ cert_output_file }} | cut -d':' -f2)" >> {{ cert_output_file }}
+
+    - name: Fetch join data file to control host
+      fetch:
+        src: "{{ cert_output_file }}"
+        dest: "/tmp/{{ target_node }}_join_data.txt"
+        flat: yes
+
+    - name: Display success message
+      debug:
+        msg: "Join data has been prepared and saved to /tmp/{{ target_node }}_join_data.txt on your control host"

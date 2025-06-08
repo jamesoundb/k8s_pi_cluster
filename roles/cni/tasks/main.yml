@@ -1,0 +1,110 @@
+---
+# CNI role - Container Network Interface setup
+
+# Setup HA components first (applies to all control plane nodes)
+- name: Install Keepalived
+  apt:
+    name: keepalived
+    state: present
+    update_cache: yes
+
+- name: Configure Keepalived
+  template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    mode: 0644
+  notify: Restart Keepalived
+
+- name: Enable and start Keepalived service
+  systemd:
+    name: keepalived
+    state: started
+    enabled: yes
+
+# Only deploy CNI after API server is running
+- name: Deploy Flannel CNI
+  block:
+    - name: Create Flannel directory
+      file:
+        path: /tmp/flannel
+        state: directory
+        mode: '0755'
+    
+    # Task: Download Flannel manifest using curl
+    - name: Download Flannel manifest
+      shell: |
+        curl -k -L -o /tmp/flannel/kube-flannel.yml https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      args:
+        creates: /tmp/flannel/kube-flannel.yml
+      when: inventory_hostname == groups['k8s_master_init'][0]
+      register: flannel_download
+    
+    - name: Modify Flannel configuration for custom CIDR if needed
+      replace:
+        path: /tmp/flannel/kube-flannel.yml
+        regexp: 'net-conf.json: \|\s+{\s+"Network": "[^"]*"'
+        replace: 'net-conf.json: |\n        {\n          "Network": "{{ pod_network_cidr }}"'
+      when: flannel_download.changed | default(false)
+    
+    # Optimize Flannel for Raspberry Pi
+    - name: Optimize Flannel resource limits for Raspberry Pi
+      replace:
+        path: /tmp/flannel/kube-flannel.yml
+        regexp: '(\s+)resources:\s+requests:\s+cpu: "100m"\s+memory: "50Mi"\s+limits:\s+cpu: "100m"\s+memory: "50Mi"'
+        replace: '\1resources:\n\1  requests:\n\1    cpu: "50m"\n\1    memory: "30Mi"\n\1  limits:\n\1    cpu: "100m"\n\1    memory: "50Mi"'
+      when: flannel_download.changed | default(false)
+    
+    # Check API server availability before applying
+    - name: Wait for API server to become available
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf cluster-info
+      register: api_status
+      until: api_status.rc == 0
+      retries: 3
+      delay: 15
+      ignore_errors: true
+      
+    - name: Apply Flannel manifest with validation if API is ready
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /tmp/flannel/kube-flannel.yml
+      register: flannel_result
+      when: api_status is defined and api_status.rc == 0
+      changed_when: "'created' in flannel_result.stdout or 'configured' in flannel_result.stdout"
+      
+    - name: Apply Flannel manifest without validation as fallback
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /tmp/flannel/kube-flannel.yml --validate=false
+      register: flannel_fallback_result
+      when: api_status is defined and api_status.rc != 0
+      changed_when: "'created' in flannel_fallback_result.stdout or 'configured' in flannel_fallback_result.stdout"
+      
+    - name: Wait for Flannel pods to be ready
+      shell: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system -l app=flannel -o jsonpath='{.items[*].status.containerStatuses[0].ready}' | grep -v false
+      register: flannel_ready
+      until: flannel_ready.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+      ignore_errors: true
+  when: inventory_hostname == groups['k8s_master_init'][0]
+
+- name: Configure Keepalived for High Availability
+  block:
+    - name: Install Keepalived
+      apt:
+        name: keepalived
+        state: present
+    
+    - name: Configure Keepalived
+      template:
+        src: keepalived.conf.j2
+        dest: /etc/keepalived/keepalived.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart keepalived
+    
+    - name: Enable and start Keepalived service
+      systemd:
+        name: keepalived
+        state: started
+        enabled: yes
+  when: inventory_hostname in groups['k8s_master']

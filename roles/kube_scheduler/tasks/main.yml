@@ -1,0 +1,56 @@
+---
+# kube_scheduler role - Kubernetes Scheduler configuration
+
+- name: Create kube-scheduler service directory
+  file:
+    path: /etc/systemd/system/kube-scheduler.service.d
+    state: directory
+    mode: '0755'
+
+# On the first control plane node (init node)
+- name: Initialize Kubernetes scheduler on first control plane node
+  block:
+    - name: Generate scheduler kubeconfig (init phase)
+      shell: kubeadm init phase kubeconfig scheduler
+      args:
+        creates: /etc/kubernetes/scheduler.conf
+  when: inventory_hostname == groups['k8s_master_init'][0]
+
+# For all control plane nodes
+- name: Optimize scheduler for resource-constrained environment
+  copy:
+    dest: /etc/systemd/system/kube-scheduler.service.d/10-performance.conf
+    content: |
+      [Service]
+      Environment="KUBE_SCHEDULER_ARGS=--leader-elect-lease-duration=30s --leader-elect-renew-deadline=20s --leader-elect-retry-period=3s"
+    mode: '0644'
+  notify: Reload systemd
+  when: inventory_hostname in groups['k8s_master']
+
+# Scheduler configuration
+- name: Create scheduler config directory
+  file:
+    path: /etc/kubernetes/scheduler
+    state: directory
+    mode: '0755'
+  when: inventory_hostname in groups['k8s_master']
+
+- name: Configure Kubernetes scheduler
+  copy:
+    dest: /etc/kubernetes/scheduler/scheduler-config.yaml
+    content: |
+      apiVersion: kubescheduler.config.k8s.io/v1
+      kind: KubeSchedulerConfiguration
+      leaderElection:
+        leaderElect: true
+      profiles:
+      - schedulerName: default-scheduler
+        plugins:
+          score:
+            disabled:
+            - name: NodeResourcesLeastAllocated
+            enabled:
+            - name: NodeResourcesMostAllocated
+              weight: 1
+    mode: '0644'
+  when: inventory_hostname in groups['k8s_master']
