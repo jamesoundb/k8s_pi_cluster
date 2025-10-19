@@ -1,0 +1,81 @@
+---
+# Common role - System Check Tasks
+
+- name: Check system memory
+  shell: free -h
+  register: memory_status
+  changed_when: false
+  
+- name: Display memory status
+  debug:
+    var: memory_status.stdout_lines
+    
+- name: Check disk space on critical filesystems
+  shell: df -h /var/lib /
+  register: disk_space
+  changed_when: false
+  
+- name: Display disk space status
+  debug:
+    var: disk_space.stdout_lines
+
+- name: Check required kernel modules
+  shell: lsmod | grep -E '(br_netfilter|overlay)'
+  register: kernel_modules
+  changed_when: false
+  ignore_errors: true
+  
+- name: Display loaded kernel modules
+  debug:
+    var: kernel_modules.stdout_lines
+    
+- name: Verify sysctl parameters
+  shell: sysctl -a | grep -E '(net.ipv4.ip_forward|net.bridge.bridge-nf-call-iptables)'
+  register: sysctl_params
+  changed_when: false
+  ignore_errors: true
+  
+- name: Display sysctl parameters
+  debug:
+    var: sysctl_params.stdout_lines
+    
+- name: Verify container runtime
+  shell: |
+    echo "=== Container Runtime Status ==="
+    systemctl status containerd | grep "Active:"
+    crictl --runtime-endpoint unix:///run/containerd/containerd.sock version || echo "crictl not working correctly"
+    ls -la /run/containerd/containerd.sock || echo "containerd socket not found"
+  register: container_runtime_status
+  changed_when: false
+  ignore_errors: true
+  
+- name: Display container runtime status
+  debug:
+    var: container_runtime_status.stdout_lines
+    
+- name: Check swap status
+  shell: swapon -s || echo "No swap detected"
+  register: swap_status
+  changed_when: false
+  
+- name: Display swap status
+  debug:
+    var: swap_status.stdout_lines
+    
+- name: Verify network connections
+  shell: ip addr | grep "inet "
+  register: network_info
+  changed_when: false
+  
+- name: Display network information
+  debug:
+    var: network_info.stdout_lines
+    
+- name: Check if port 6443 is in use
+  shell: ss -tulpn | grep 6443 || echo "Port 6443 is free"
+  register: port_status
+  changed_when: false
+  
+- name: Display port 6443 status
+  debug:
+    var: port_status.stdout_lines

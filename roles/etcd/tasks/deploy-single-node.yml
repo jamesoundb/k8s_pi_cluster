@@ -1,0 +1,114 @@
+---
+# Tasks for deploying a single-node etcd on k8s-node-1
+
+- name: Remove any existing etcd manifest
+  file:
+    path: /etc/kubernetes/manifests/etcd.yaml
+    state: absent
+  
+- name: Wait for any running etcd to stop
+  pause:
+    seconds: 10
+    
+- name: Backup existing etcd data if any
+  command: mv /var/lib/etcd /var/lib/etcd.bak-{{ ansible_date_time.iso8601_basic_short }}
+  args:
+    removes: /var/lib/etcd
+  ignore_errors: true
+  
+- name: Create fresh etcd data directory
+  file:
+    path: /var/lib/etcd
+    state: directory
+    mode: '0700'
+    owner: root
+    group: root
+  
+- name: Create etcd manifest for single node
+  template:
+    src: etcd-single-node.yaml.j2
+    dest: /etc/kubernetes/manifests/etcd.yaml
+    mode: '0644'
+  
+- name: Wait for etcd to start
+  pause:
+    seconds: 30
+  
+- name: Check if etcd container is running
+  shell: crictl ps | grep etcd || echo "No etcd container"
+  register: etcd_container
+  retries: 5
+  delay: 10
+  until: "'No etcd container' not in etcd_container.stdout"
+  ignore_errors: true
+  
+- name: Get etcd container logs
+  shell: |
+    ETCD_ID=$(crictl ps | grep etcd | awk '{print $1}')
+    if [ -n "$ETCD_ID" ]; then
+      crictl logs $ETCD_ID | tail -n 50
+    else
+      echo "No etcd container found"
+    fi
+  register: etcd_logs
+  changed_when: false
+  
+- name: Display etcd container logs
+  debug:
+    var: etcd_logs.stdout_lines
+  
+- name: Check etcd certificate files
+  shell: |
+    echo "Checking etcd certificate files..."
+    ls -la /etc/kubernetes/pki/etcd/
+  register: cert_files
+  changed_when: false
+  
+- name: Display certificate files
+  debug:
+    var: cert_files.stdout_lines
+  
+- name: Verify etcd health
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    --endpoints=https://127.0.0.1:2379 \
+    endpoint health
+  register: etcd_health_check
+  failed_when: false
+  retries: 5
+  delay: 10
+  until: etcd_health_check.rc == 0
+  
+- name: Display etcd health status
+  debug:
+    msg: "{{ etcd_health_check.stdout_lines | default(['Etcd health check failed']) }}"
+
+- name: Restart kubelet if etcd is unhealthy
+  systemd:
+    name: kubelet
+    state: restarted
+  when: etcd_health_check.rc != 0
+  
+- name: Wait for kubelet restart to complete
+  pause:
+    seconds: 30
+  when: etcd_health_check.rc != 0
+  
+- name: Verify etcd health again
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    --endpoints=https://127.0.0.1:2379 \
+    endpoint health
+  register: etcd_health_retry
+  failed_when: etcd_health_retry.rc != 0
+  when: etcd_health_check.rc != 0
+  
+- name: Display final etcd health status
+  debug:
+    msg: "{{ etcd_health_retry.stdout_lines | default(etcd_health_check.stdout_lines) | default(['Etcd health check failed']) }}"

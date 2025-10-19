@@ -1,0 +1,76 @@
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+nodeRegistration:
+  name: {{ inventory_hostname }}
+  criSocket: "unix:///run/containerd/containerd.sock"
+localAPIEndpoint:
+  advertiseAddress: {{ ansible_host }}
+  bindPort: {{ apiserver_bind_port | default('6444') }}
+bootstrapTokens:
+- groups:
+  - system:bootstrappers:kubeadm:default-node-token
+  ttl: 24h0m0s
+  usages:
+  - signing
+  - authentication
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: v{{ k8s_version }}
+controlPlaneEndpoint: "{{ control_plane_endpoint }}:{{ control_plane_endpoint_port | default('6443') }}"
+networking:
+  podSubnet: {{ pod_network_cidr }}
+  serviceSubnet: {{ service_network_cidr | default('10.245.0.0/16') }}
+apiServer:
+  extraArgs:
+    enable-admission-plugins: "{{ apiserver_enable_admission_plugins }}"
+    max-requests-inflight: "{{ apiserver_max_requests_inflight }}"
+    max-mutating-requests-inflight: "{{ apiserver_max_mutating_requests_inflight }}"
+    request-timeout: "{{ apiserver_request_timeout }}"
+    etcd-cafile: /etc/kubernetes/pki/etcd/ca.crt
+    etcd-certfile: /etc/kubernetes/pki/apiserver-etcd-client.crt
+    etcd-keyfile: /etc/kubernetes/pki/apiserver-etcd-client.key
+    # Use only localhost etcd initially for stability
+    etcd-servers: "https://127.0.0.1:2379"
+    bind-address: "0.0.0.0"
+    advertise-address: "{{ ansible_host }}"
+    secure-port: "{{ apiserver_bind_port | default('6444') }}"
+    event-ttl: "1h"
+  timeoutForControlPlane: 8m0s
+etcd:
+  local:
+    dataDir: "/var/lib/etcd"
+    extraArgs:
+      cert-file: /etc/kubernetes/pki/etcd/server.crt
+      key-file: /etc/kubernetes/pki/etcd/server.key
+      peer-cert-file: /etc/kubernetes/pki/etcd/peer.crt
+      peer-key-file: /etc/kubernetes/pki/etcd/peer.key
+      # Simple single-node configuration
+      initial-cluster: "{{ inventory_hostname }}=https://{{ ansible_host }}:2380"
+      initial-advertise-peer-urls: "https://{{ ansible_host }}:2380"
+      initial-cluster-state: "new"
+      name: "{{ inventory_hostname }}"
+      listen-peer-urls: "https://{{ ansible_host }}:2380"
+      listen-client-urls: "https://{{ ansible_host }}:2379,https://127.0.0.1:2379"
+      advertise-client-urls: "https://{{ ansible_host }}:2379"
+      trusted-ca-file: /etc/kubernetes/pki/etcd/ca.crt
+      peer-trusted-ca-file: /etc/kubernetes/pki/etcd/ca.crt
+      peer-client-cert-auth: "true"
+      client-cert-auth: "true"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+authentication:
+  anonymous:
+    enabled: false
+  webhook:
+    enabled: true
+  x509:
+    clientCAFile: /etc/kubernetes/pki/ca.crt
+authorization:
+  mode: Webhook
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: "ipvs"

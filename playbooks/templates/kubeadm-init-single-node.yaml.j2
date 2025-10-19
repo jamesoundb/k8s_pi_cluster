@@ -1,0 +1,42 @@
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+nodeRegistration:
+  name: {{ inventory_hostname }}
+  criSocket: "unix:///run/containerd/containerd.sock"
+localAPIEndpoint:
+  advertiseAddress: {{ ansible_host }}
+  bindPort: 6444
+bootstrapTokens:
+- groups:
+  - system:bootstrappers:kubeadm:default-node-token
+  ttl: 24h0m0s
+  usages:
+  - signing
+  - authentication
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: v{{ k8s_version | default('1.34.1') }}
+networking:
+  podSubnet: {{ pod_network_cidr | default('10.244.0.0/16') }}
+  serviceSubnet: {{ service_network_cidr | default('10.245.0.0/16') }}
+apiServer:
+  extraArgs:
+    enable-admission-plugins: "NodeRestriction"
+    etcd-cafile: /etc/kubernetes/pki/etcd/ca.crt
+    etcd-certfile: /etc/kubernetes/pki/apiserver-etcd-client.crt
+    etcd-keyfile: /etc/kubernetes/pki/apiserver-etcd-client.key
+    etcd-servers: "https://127.0.0.1:2379"
+    bind-address: "0.0.0.0"
+    advertise-address: "{{ ansible_host }}"
+    secure-port: "6444"
+  timeoutForControlPlane: 4m0s
+controllerManager:
+  extraArgs:
+    bind-address: "0.0.0.0"
+scheduler:
+  extraArgs:
+    bind-address: "0.0.0.0"
+etcd:
+  local:
+    dataDir: "/var/lib/etcd"

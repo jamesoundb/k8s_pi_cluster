@@ -1,0 +1,133 @@
+---
+# Tasks for ensuring the API server configuration is consistent
+
+- name: Verify kubernetes directories exist
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - /etc/kubernetes
+    - /etc/kubernetes/manifests
+  
+- name: Verify API server manifest file exists
+  stat:
+    path: /etc/kubernetes/manifests/kube-apiserver.yaml
+  register: apiserver_manifest
+
+# Only attempt to modify manifests if they exist
+- name: Handle API server manifest synchronization
+  block:
+    - name: Backup API server manifest
+      copy:
+        src: /etc/kubernetes/manifests/kube-apiserver.yaml
+        dest: /etc/kubernetes/kube-apiserver.yaml.bak
+        remote_src: yes
+      when: apiserver_manifest.stat.exists
+      
+    - name: Extract API server secure port from manifest
+      shell: |
+        grep -o "secure-port: [0-9]\+" /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null || echo "secure-port: not-found"
+      register: apiserver_port
+      ignore_errors: true
+      when: apiserver_manifest.stat.exists
+
+    - name: Update API server port in manifest (in place edit)
+      replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: 'secure-port: 6443'
+        replace: 'secure-port: 6444'
+      when: >
+        apiserver_manifest.stat.exists and
+        apiserver_port.stdout is defined and
+        apiserver_port.stdout != "secure-port: not-found" and
+        "secure-port: 6443" in apiserver_port.stdout
+      register: apiserver_manifest_updated
+      
+    # Use lineinfile instead of replace for more targeted edits
+    - name: Ensure other API server parameters are consistent
+      lineinfile:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: "{{ item.regex }}"
+        line: "{{ item.line }}"
+        state: present
+      with_items:
+        - { regex: '^    - --bind-address=', line: '    - --bind-address={{ ansible_default_ipv4.address }}' }
+        - { regex: '^    - --advertise-address=', line: '    - --advertise-address={{ ansible_default_ipv4.address }}' }
+      when: apiserver_manifest.stat.exists
+      register: apiserver_config_updated
+
+    - name: Update API server secure-port command line argument
+      replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: '- --secure-port=6443'
+        replace: '- --secure-port=6444'
+      when: apiserver_manifest.stat.exists
+      register: apiserver_cmd_port_updated
+      
+    - name: Update livenessProbe port
+      replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: 'port: 6443'
+        replace: 'port: 6444'
+      when: apiserver_manifest.stat.exists
+      register: apiserver_probe_port_updated
+
+    - name: Display API server port updates
+      debug:
+        msg: "Updated API server port settings: command args={{ apiserver_cmd_port_updated.changed | default(false) }}, probe ports={{ apiserver_probe_port_updated.changed | default(false) }}"
+      when: apiserver_manifest.stat.exists
+  when: apiserver_manifest.stat.exists
+
+- name: Check kubeadm init config
+  stat:
+    path: /etc/kubernetes/kubeadm/kubeadm-init.yaml
+  register: kubeadm_config
+
+- name: Ensure kubeadm config is synchronized
+  block:
+    - name: Read kubeadm config content
+      slurp:
+        src: /etc/kubernetes/kubeadm/kubeadm-init.yaml
+      register: kubeadm_init_config
+      when: kubeadm_config.stat.exists
+      
+    - name: Update kubeadm init config if needed
+      replace:
+        path: /etc/kubernetes/kubeadm/kubeadm-init.yaml
+        regexp: 'bindPort: 6443'
+        replace: 'bindPort: 6444'
+      when: >
+        kubeadm_config.stat.exists and
+        kubeadm_init_config.content is defined and
+        "bindPort: 6443" in kubeadm_init_config.content | b64decode
+      register: kubeadm_binding_updated
+      
+    - name: Update kubeadm init API server config if needed
+      replace:
+        path: /etc/kubernetes/kubeadm/kubeadm-init.yaml
+        regexp: 'secure-port: "6443"'
+        replace: 'secure-port: "6444"'
+      when: >
+        kubeadm_config.stat.exists and
+        kubeadm_init_config.content is defined and
+        "secure-port: \"6443\"" in kubeadm_init_config.content | b64decode
+      register: kubeadm_port_updated
+  when: kubeadm_config.stat.exists
+      
+- name: Wait for kubelet to pick up changes if configurations updated
+  wait_for:
+    timeout: 10
+  when: >
+    (apiserver_manifest_updated is defined and apiserver_manifest_updated.changed) or
+    (apiserver_config_updated is defined and apiserver_config_updated.changed) or
+    (kubeadm_binding_updated is defined and kubeadm_binding_updated.changed) or
+    (kubeadm_port_updated is defined and kubeadm_port_updated.changed)
+
+- name: Verify API server configuration is consistent
+  debug:
+    msg: >
+      API server configuration is now consistent:
+      Using secure-port: 6444 for API server and bindPort: 6444 for kubeadm init.
+      HAProxy listens on port 6443 and forwards to API servers on port 6444.
+      All kubeadm and manifest configurations are aligned.

@@ -1,0 +1,72 @@
+---
+# Tasks for joining an existing etcd cluster
+
+- name: Remove any existing etcd manifest
+  file:
+    path: /etc/kubernetes/manifests/etcd.yaml
+    state: absent
+  
+- name: Wait for any running etcd to stop
+  pause:
+    seconds: 10
+    
+- name: Backup existing etcd data if any
+  command: mv /var/lib/etcd /var/lib/etcd.bak-{{ ansible_date_time.iso8601_basic_short }}
+  args:
+    removes: /var/lib/etcd
+  ignore_errors: true
+  
+- name: Create fresh etcd data directory
+  file:
+    path: /var/lib/etcd
+    state: directory
+    mode: '0700'
+    owner: root
+    group: root
+  
+- name: Create etcd manifest for joining existing cluster
+  template:
+    src: etcd-join.yaml.j2
+    dest: /etc/kubernetes/manifests/etcd.yaml
+    mode: '0644'
+  
+- name: Wait for etcd to start
+  pause:
+    seconds: 30
+  
+- name: Check if etcd container is running
+  shell: crictl ps | grep etcd || echo "No etcd container"
+  register: etcd_container
+  retries: 5
+  delay: 10
+  until: "'No etcd container' not in etcd_container.stdout"
+  
+- name: Verify etcd health
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    --endpoints=https://127.0.0.1:2379 \
+    endpoint health
+  register: etcd_health_check
+  failed_when: false
+  
+- name: Display etcd health status
+  debug:
+    msg: "{{ etcd_health_check.stdout_lines | default(['Etcd health check failed']) }}"
+  
+- name: Check etcd member list
+  shell: |
+    ETCDCTL_API=3 etcdctl \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key \
+    --endpoints=https://127.0.0.1:2379 \
+    member list -w table
+  register: etcd_members
+  failed_when: false
+  
+- name: Display etcd cluster members
+  debug:
+    var: etcd_members.stdout_lines

@@ -1,0 +1,74 @@
+---
+# Tasks to ensure API server to etcd client certificates exist
+# This is critical for kube-apiserver to communicate with etcd
+
+- name: Check if etcd certificates exist
+  stat:
+    path: "/etc/kubernetes/pki/etcd/ca.crt"
+  register: etcd_cert_exists
+
+- name: Check if apiserver-etcd-client certificate exists
+  stat:
+    path: "/etc/kubernetes/pki/apiserver-etcd-client.crt"
+  register: apiserver_etcd_client_exists
+  
+- name: Generate apiserver-etcd-client certificates if missing
+  block:
+    - name: Create private key
+      shell: openssl genrsa -out /etc/kubernetes/pki/apiserver-etcd-client.key 2048
+      args:
+        creates: /etc/kubernetes/pki/apiserver-etcd-client.key
+
+    - name: Create certificate request config
+      copy:
+        dest: /etc/kubernetes/pki/apiserver-etcd-client.conf
+        content: |
+          [req]
+          req_extensions = v3_req
+          distinguished_name = req_distinguished_name
+          [req_distinguished_name]
+          [ v3_req ]
+          basicConstraints = CA:FALSE
+          keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+          extendedKeyUsage = clientAuth
+        mode: '0644'
+
+    - name: Create CSR
+      shell: >
+        openssl req -new -key /etc/kubernetes/pki/apiserver-etcd-client.key 
+        -subj "/CN=kube-apiserver-etcd-client/O=system:masters" 
+        -out /etc/kubernetes/pki/apiserver-etcd-client.csr
+        -config /etc/kubernetes/pki/apiserver-etcd-client.conf
+      args:
+        creates: /etc/kubernetes/pki/apiserver-etcd-client.csr
+
+    - name: Sign certificate
+      shell: >
+        openssl x509 -req -in /etc/kubernetes/pki/apiserver-etcd-client.csr 
+        -CA /etc/kubernetes/pki/etcd/ca.crt 
+        -CAkey /etc/kubernetes/pki/etcd/ca.key 
+        -CAcreateserial -out /etc/kubernetes/pki/apiserver-etcd-client.crt 
+        -days 10000 
+        -extensions v3_req 
+        -extfile /etc/kubernetes/pki/apiserver-etcd-client.conf
+      args:
+        creates: /etc/kubernetes/pki/apiserver-etcd-client.crt
+  when: 
+    - etcd_cert_exists.stat.exists
+    - not apiserver_etcd_client_exists.stat.exists
+
+- name: Verify certificates
+  shell: >
+    openssl verify -CAfile /etc/kubernetes/pki/etcd/ca.crt 
+    /etc/kubernetes/pki/apiserver-etcd-client.crt
+  register: cert_verification
+  changed_when: false
+  ignore_errors: true
+  when: 
+    - etcd_cert_exists.stat.exists
+    - apiserver_etcd_client_exists.stat.exists or (apiserver_etcd_client_exists is changed)
+
+- name: Display certificate verification results
+  debug:
+    var: cert_verification.stdout_lines
+  when: cert_verification is defined

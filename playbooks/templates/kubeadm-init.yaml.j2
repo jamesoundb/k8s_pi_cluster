@@ -1,0 +1,61 @@
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+nodeRegistration:
+  name: {{ ansible_hostname }}
+  criSocket: unix:///run/containerd/containerd.sock
+  taints:
+  - effect: NoSchedule
+    key: node-role.kubernetes.io/control-plane
+localAPIEndpoint:
+  advertiseAddress: {{ ansible_default_ipv4.address }}
+  bindPort: 6443
+skipPhases:
+- addon/kube-proxy
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: v{{ k8s_version }}
+apiServer:
+  certSANs:
+  - {{ ansible_hostname }}
+  - {{ ansible_default_ipv4.address }}
+  - {{ control_plane_endpoint }}
+  - kubernetes
+  - kubernetes.default
+  - kubernetes.default.svc
+  - kubernetes.default.svc.cluster.local
+  extraArgs:
+    secure-port: "6443"
+controlPlaneEndpoint: "{{ control_plane_endpoint }}:6443"
+networking:
+  serviceSubnet: "{{ service_cidr }}"
+  podSubnet: "{{ pod_cidr }}"
+  dnsDomain: cluster.local
+etcd:
+  local:
+    serverCertSANs:
+    - {{ ansible_hostname }}
+    - {{ ansible_default_ipv4.address }}
+    peerCertSANs:
+    - {{ ansible_hostname }}
+    - {{ ansible_default_ipv4.address }}
+    extraArgs:
+      initial-cluster: "{{ ansible_hostname }}=https://{{ ansible_default_ipv4.address }}:2380"
+      initial-cluster-state: new
+      name: {{ ansible_hostname }}
+      listen-peer-urls: "https://{{ ansible_default_ipv4.address }}:2380,https://127.0.0.1:2380"
+      listen-client-urls: "https://{{ ansible_default_ipv4.address }}:2379,https://127.0.0.1:2379"
+      advertise-client-urls: "https://{{ ansible_default_ipv4.address }}:2379"
+      initial-advertise-peer-urls: "https://{{ ansible_default_ipv4.address }}:2380"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+cgroupDriver: systemd
+failSwapOn: false
+systemReserved:
+  memory: 512Mi
+  cpu: 500m
+kubeReserved:
+  memory: 256Mi
+  cpu: 250m

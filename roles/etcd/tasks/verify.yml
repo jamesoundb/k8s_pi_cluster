@@ -1,0 +1,80 @@
+---
+# Tasks to verify and recover etcd
+
+- name: Check if etcd is running
+  shell: systemctl status etcd || true
+  register: etcd_status
+  changed_when: false
+  ignore_errors: true
+
+- name: Check etcd health using etcdctl
+  shell: >
+    ETCDCTL_API=3 etcdctl 
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt 
+    --cert=/etc/kubernetes/pki/etcd/server.crt 
+    --key=/etc/kubernetes/pki/etcd/server.key 
+    --endpoints=https://127.0.0.1:2379 
+    endpoint health || echo "etcd health check failed"
+  register: etcd_health
+  changed_when: false
+  ignore_errors: true
+
+- name: Display etcd health status
+  debug:
+    msg: "etcd health: {{ etcd_health.stdout }}"
+
+- name: Check etcd member list
+  shell: >
+    ETCDCTL_API=3 etcdctl 
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt 
+    --cert=/etc/kubernetes/pki/etcd/server.crt 
+    --key=/etc/kubernetes/pki/etcd/server.key 
+    --endpoints=https://127.0.0.1:2379 
+    member list -w table || echo "etcd member list failed"
+  register: etcd_members
+  changed_when: false
+  ignore_errors: true
+
+- name: Display etcd members
+  debug:
+    var: etcd_members.stdout_lines
+
+- name: Check if etcd needs recovery
+  set_fact:
+    etcd_needs_recovery: "{{ 'health check failed' in etcd_health.stdout or etcd_health.rc != 0 or 'member list failed' in etcd_members.stdout or etcd_members.rc != 0 }}"
+
+# Recovery tasks
+- name: Attempt etcd recovery if needed
+  block:
+    - name: Backup etcd data directory
+      shell: |
+        mkdir -p /var/lib/etcd-backup
+        cp -a /var/lib/etcd/* /var/lib/etcd-backup/ || true
+      when: etcd_needs_recovery
+
+    - name: Restart etcd service
+      systemd:
+        name: etcd
+        state: restarted
+      when: etcd_needs_recovery
+
+    - name: Wait for etcd to become healthy
+      shell: >
+        ETCDCTL_API=3 etcdctl 
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt 
+        --cert=/etc/kubernetes/pki/etcd/server.crt 
+        --key=/etc/kubernetes/pki/etcd/server.key 
+        --endpoints=https://127.0.0.1:2379 
+        endpoint health || echo "etcd health check failed"
+      register: etcd_health_after_restart
+      until: "'is healthy' in etcd_health_after_restart.stdout"
+      retries: 5
+      delay: 10
+      when: etcd_needs_recovery
+      ignore_errors: true
+
+    - name: Display etcd health after recovery
+      debug:
+        msg: "etcd health after recovery: {{ etcd_health_after_restart.stdout | default('still not healthy') }}"
+      when: etcd_needs_recovery
+  when: etcd_needs_recovery | default(false)

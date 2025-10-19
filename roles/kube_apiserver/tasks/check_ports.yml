@@ -1,0 +1,34 @@
+---
+# Tasks to check and handle API server port conflicts
+- name: Check if port 6443 is in use
+  shell: ss -tuln | grep 6443 || echo "Port not in use"
+  register: port_6443_check
+  changed_when: false
+
+- name: Check if port 6444 is in use
+  shell: ss -tuln | grep 6444 || echo "Port not in use"
+  register: port_6444_check
+  changed_when: false
+
+- name: Display port check results
+  debug:
+    msg: |
+      Port 6443 status: {{ 'In use' if 'Port not in use' not in port_6443_check.stdout else 'Available' }}
+      Port 6444 status: {{ 'In use' if 'Port not in use' not in port_6444_check.stdout else 'Available' }}
+
+- name: Set kubeadm ignore flags based on port checks
+  set_fact:
+    kubeadm_ignore_flags: >-
+      {% set flags = [] %}
+      {% if 'Port not in use' not in port_6443_check.stdout %}
+        {% set _ = flags.append('Port-6443') %}
+      {% endif %}
+      {% if 'Port not in use' not in port_6444_check.stdout %}
+        {% set _ = flags.append('Port-6444') %}
+      {% endif %}
+      {% if flags|length > 0 %}--ignore-preflight-errors={{ flags|join(',') }}{% else %}{% endif %}
+
+- name: Show ignore flags that will be used
+  debug:
+    var: kubeadm_ignore_flags
+  when: kubeadm_ignore_flags != ""

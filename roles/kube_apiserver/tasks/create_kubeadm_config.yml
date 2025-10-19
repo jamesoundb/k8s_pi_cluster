@@ -1,0 +1,26 @@
+---
+# Create kubeadm configuration file
+
+- name: Create kubeadm directory
+  file:
+    path: /etc/kubernetes/kubeadm
+    state: directory
+    mode: '0755'
+    
+- name: Create kubeadm config template
+  template:
+    src: kubeadm-init.yaml.j2
+    dest: /etc/kubernetes/kubeadm/kubeadm-init.yaml
+    mode: '0644'
+  register: kubeadm_config
+  
+- name: Display kubeadm config
+  shell: cat /etc/kubernetes/kubeadm/kubeadm-init.yaml
+  register: kubeadm_config_content
+  changed_when: false
+  when: kubeadm_config.changed
+  
+- name: Show kubeadm config
+  debug:
+    var: kubeadm_config_content.stdout_lines
+  when: kubeadm_config.changed

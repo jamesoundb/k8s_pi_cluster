@@ -1,0 +1,32 @@
+---
+# defaults file for etcd role
+
+# Enable progressive cluster formation (start with a single node, then add others)
+etcd_progressive_cluster: true
+
+# etcd version to use
+etcd_version: 3.5.6-0
+etcd_image: registry.k8s.io/etcd:{{ etcd_version }}
+
+# Network ports
+etcd_client_port: 2379
+etcd_peer_port: 2380
+etcd_metrics_port: 2381
+
+# Certificate paths
+etcd_cert_dir: /etc/kubernetes/pki/etcd
+etcd_ca_cert: "{{ etcd_cert_dir }}/ca.crt"
+etcd_ca_key: "{{ etcd_cert_dir }}/ca.key"
+etcd_server_cert: "{{ etcd_cert_dir }}/server.crt"
+etcd_server_key: "{{ etcd_cert_dir }}/server.key"
+etcd_peer_cert: "{{ etcd_cert_dir }}/peer.crt"
+etcd_peer_key: "{{ etcd_cert_dir }}/peer.key"
+apiserver_etcd_client_cert: "/etc/kubernetes/pki/apiserver-etcd-client.crt"
+apiserver_etcd_client_key: "/etc/kubernetes/pki/apiserver-etcd-client.key"
+
+# Data directory
+etcd_data_dir: /var/lib/etcd
+
+# Timeout values for checks (in seconds)
+etcd_health_check_timeout: 10
+etcd_connection_timeout: 5

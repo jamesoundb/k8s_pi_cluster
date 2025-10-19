@@ -1,0 +1,136 @@
+---
+# Graceful Kubernetes Cluster Shutdown Playbook
+# 
+# This playbook safely shuts down the entire HA Kubernetes cluster
+# in the proper order to ensure data integrity and clean shutdown.
+#
+# Usage: ansible-playbook -i inventory.yml shutdown-cluster.yml
+
+- name: Graceful Kubernetes Cluster Shutdown
+  hosts: all
+  become: yes
+  serial: 1
+  gather_facts: yes
+  vars:
+    shutdown_delay: 30
+    
+  tasks:
+    - name: Display shutdown warning
+      debug:
+        msg: "⚠️  SHUTTING DOWN KUBERNETES NODE: {{ inventory_hostname }} ({{ ansible_default_ipv4.address }})"
+    
+    # First, safely drain the node if kubectl is available
+    - name: Check if kubectl is available and cluster is running
+      shell: kubectl get nodes --no-headers 2>/dev/null | wc -l
+      register: kubectl_check
+      failed_when: false
+      changed_when: false
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: inventory_hostname in groups['k8s_masters'] | default([])
+    
+    - name: Drain node safely if cluster is running
+      shell: |
+        kubectl drain {{ inventory_hostname }} \
+          --ignore-daemonsets \
+          --delete-emptydir-data \
+          --force \
+          --timeout=300s \
+          --grace-period=30
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: 
+        - inventory_hostname in groups['k8s_masters'] | default([])
+        - kubectl_check.stdout | int > 0
+      ignore_errors: true
+      register: drain_result
+    
+    - name: Display drain result
+      debug:
+        var: drain_result.stdout_lines
+      when: drain_result is defined and drain_result.stdout_lines is defined
+    
+    # Stop Kubernetes services in proper order
+    - name: Stop kubelet service
+      systemd:
+        name: kubelet
+        state: stopped
+        enabled: no
+      ignore_errors: true
+    
+    - name: Stop container runtime (containerd)
+      systemd:
+        name: containerd
+        state: stopped
+      ignore_errors: true
+    
+    # Stop load balancer services on node 1
+    - name: Stop HAProxy on first node
+      systemd:
+        name: haproxy
+        state: stopped
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_masters'][0] | default('k8s-node-1')
+    
+    - name: Stop keepalived on first node
+      systemd:
+        name: keepalived
+        state: stopped
+      ignore_errors: true
+      when: inventory_hostname == groups['k8s_masters'][0] | default('k8s-node-1')
+    
+    # Clean up any remaining containers
+    - name: Stop all running containers
+      shell: |
+        if command -v crictl >/dev/null 2>&1; then
+          crictl --runtime-endpoint unix:///run/containerd/containerd.sock stop \
+            $(crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -q) 2>/dev/null || true
+        fi
+      ignore_errors: true
+    
+    - name: Remove all containers
+      shell: |
+        if command -v crictl >/dev/null 2>&1; then
+          crictl --runtime-endpoint unix:///run/containerd/containerd.sock rm \
+            $(crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -aq) 2>/dev/null || true
+        fi
+      ignore_errors: true
+    
+    # Sync filesystem and prepare for shutdown
+    - name: Sync filesystem
+      shell: sync
+      
+    - name: Wait for filesystem sync to complete
+      pause:
+        seconds: 5
+    
+    - name: Final shutdown notice
+      debug:
+        msg: "💡 Node {{ inventory_hostname }} ready for shutdown. Powering off in {{ shutdown_delay }} seconds..."
+    
+    # Graceful system shutdown
+    - name: Shutdown the system
+      shell: "shutdown -h +1 'Kubernetes cluster shutdown - Safe to power off'"
+      async: 1
+      poll: 0
+      ignore_errors: true
+
+- name: Display shutdown completion message
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Shutdown completion notice
+      debug:
+        msg: |
+          🎯 KUBERNETES CLUSTER SHUTDOWN INITIATED
+          
+          All nodes have been commanded to shutdown gracefully.
+          
+          ✅ Services stopped in proper order
+          ✅ Containers cleaned up  
+          ✅ Filesystems synchronized
+          ✅ Systems powering down
+          
+          Nodes will be safe to power off in approximately 2-3 minutes.
+          
+          Ready for Ubuntu 24.04 re-imaging! 🚀

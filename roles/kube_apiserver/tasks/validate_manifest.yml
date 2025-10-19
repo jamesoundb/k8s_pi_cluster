@@ -1,0 +1,197 @@
+---
+# Streamlined approach to validate and fix the API server manifest
+
+# Step 0: Verify containerd is running properly (required for manifest creation)
+- name: Check if containerd service is active
+  systemd:
+    name: containerd
+    state: started
+    enabled: yes
+  register: containerd_status
+  ignore_errors: true
+
+- name: Check for containerd socket
+  stat:
+    path: /run/containerd/containerd.sock
+  register: containerd_socket
+
+- name: Fix containerd if not running properly
+  block:
+    - name: Notify that containerd needs to be fixed
+      debug:
+        msg: "Containerd service is not running properly. This must be fixed before API server can start."
+
+    - name: Include containerd verification tasks
+      include_role:
+        name: containerd
+        tasks_from: verify_containerd.yml
+  when: not containerd_socket.stat.exists or (containerd_status.status is defined and containerd_status.status.ActiveState != 'active')
+
+# Step 1: Check if manifest exists and back it up
+- name: Check and backup API server manifest
+  block:
+    - name: Check if API server manifest exists
+      stat:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+      register: apiserver_manifest_stat
+    
+    - name: Create backup of existing API server manifest
+      copy:
+        src: /etc/kubernetes/manifests/kube-apiserver.yaml
+        dest: /etc/kubernetes/kube-apiserver.yaml.backup
+        remote_src: yes
+      when: apiserver_manifest_stat.stat.exists
+  rescue:
+    - name: Display error if manifest exists but can't be accessed
+      debug:
+        msg: "Warning: API server manifest exists but could not be backed up"
+
+# Step 2: Validate and fix the manifest
+- name: Validate and repair manifest
+  block:
+    - name: Check if manifest is valid YAML
+      shell: |
+        python3 -c "import yaml; yaml.safe_load(open('/etc/kubernetes/manifests/kube-apiserver.yaml'))" 2>/dev/null && echo "valid" || echo "invalid"
+      register: yaml_check
+      changed_when: false
+      when: apiserver_manifest_stat.stat.exists
+      ignore_errors: true
+    
+    - name: Display validation result
+      debug:
+        msg: "API server manifest validation: {{ yaml_check.stdout | default('unable to validate') }}"
+      when: yaml_check is defined
+    
+    - name: Fix manifest by regenerating with kubeadm if invalid
+      block:
+        - name: Remove invalid manifest
+          file:
+            path: /etc/kubernetes/manifests/kube-apiserver.yaml
+            state: absent
+        
+        - name: Restart kubelet service to prevent stale state
+          systemd:
+            name: kubelet
+            state: restarted
+            daemon_reload: true
+        
+        - name: Regenerate API server manifest with kubeadm
+          shell: |
+            kubeadm init phase control-plane apiserver --config=/etc/kubernetes/kubeadm/kubeadm-init.yaml
+          register: regenerate_result
+        
+        - name: Wait for manifest to be created (10 seconds)
+          pause:
+            seconds: 10
+      when: >
+        apiserver_manifest_stat.stat.exists and 
+        (yaml_check is failed or 
+         (yaml_check is defined and yaml_check.stdout == "invalid"))
+  
+    - name: Fix API server port if needed
+      block:
+        - name: Check secure-port in manifest
+          shell: |
+            grep -q "secure-port=6444" /etc/kubernetes/manifests/kube-apiserver.yaml || echo "Port incorrect"
+          register: port_check
+          changed_when: false
+        
+        - name: Update API server port to 6444
+          replace:
+            path: /etc/kubernetes/manifests/kube-apiserver.yaml
+            regexp: 'secure-port=6443'
+            replace: 'secure-port=6444'
+          when: port_check.stdout is defined and 'Port incorrect' in port_check.stdout
+        
+        - name: Wait for kubelet to pick up changes (5 seconds)
+          pause:
+            seconds: 5
+          when: port_check.stdout is defined and 'Port incorrect' in port_check.stdout
+      when: apiserver_manifest_stat.stat.exists and yaml_check.stdout == "valid"
+  
+  # Step 3: Verify containerd is running
+- name: Verify containerd status
+  block:
+    - name: Check if containerd service is active
+      service_facts:
+      register: services_state
+
+    - name: Display containerd service status
+      debug:
+        msg: "Containerd service status: {{ 'running' if services_state.ansible_facts.services['containerd.service'] is defined and services_state.ansible_facts.services['containerd.service']['state'] == 'running' else 'not running' }}"
+
+    - name: Start containerd if not running
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+      when: services_state.ansible_facts.services['containerd.service'] is not defined or services_state.ansible_facts.services['containerd.service']['state'] != 'running'
+
+    - name: Wait for containerd socket to be available
+      wait_for:
+        path: /run/containerd/containerd.sock
+        state: present
+        timeout: 30
+      register: containerd_socket
+
+    - name: Check containerd socket permissions
+      stat:
+        path: /run/containerd/containerd.sock
+      register: socket_check
+
+    - name: Display socket permissions
+      debug:
+        msg: "Socket exists: {{ socket_check.stat.exists }}, Mode: {{ socket_check.stat.mode | default('unknown') }}"
+
+  # Step 4: Verify API server is running
+- name: Verify API server status
+  block:
+    - name: Check if API server container is running
+      shell: |
+        crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps | grep kube-apiserver || echo "Not running"
+      register: apiserver_status
+      changed_when: false
+    
+    - name: Display API server container status
+      debug:
+        msg: "API server container status: {{ 'Running' if 'Not running' not in apiserver_status.stdout else 'Not running' }}"
+
+# Step 5: Check manifest file permissions
+- name: Check and fix manifest file permissions
+  block:
+    - name: Find all manifest files
+      find:
+        paths: /etc/kubernetes/manifests
+        patterns: "*.yaml"
+      register: manifest_files
+
+    - name: Display manifest files
+      debug:
+        msg: "Found {{ manifest_files.files | length }} manifest files"
+      when: manifest_files.files is defined
+
+    - name: Check manifest file permissions
+      stat:
+        path: "{{ item.path }}"
+      register: manifest_file_stats
+      with_items: "{{ manifest_files.files }}"
+      when: manifest_files.files is defined
+
+    - name: Show files with incorrect permissions
+      debug:
+        msg: "File {{ item.item.path }} has incorrect permissions: {{ item.stat.mode }}"
+      with_items: "{{ manifest_file_stats.results }}"
+      when: item.stat.mode != '0644'
+
+    - name: Fix manifest file permissions
+      file:
+        path: "{{ item.path }}"
+        mode: '0644'
+      with_items: "{{ manifest_files.files }}"
+      register: fixed_permissions
+
+    - name: Restart kubelet if permissions were fixed
+      systemd:
+        name: kubelet
+        state: restarted
+      when: fixed_permissions.changed

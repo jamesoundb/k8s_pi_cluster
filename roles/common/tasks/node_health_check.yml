@@ -1,0 +1,64 @@
+---
+# Tasks to check node connectivity and health
+
+- name: Check if ansible_host is defined
+  fail:
+    msg: "ansible_host is not defined for {{ inventory_hostname }}"
+  when: ansible_host is not defined
+  ignore_errors: true
+
+- name: Check node connectivity with ping
+  ping:
+  register: ping_result
+  ignore_errors: true
+
+- name: Set node connectivity status
+  set_fact:
+    node_unreachable: "{{ ping_result is failed }}"
+
+- name: Display node connectivity status
+  debug:
+    msg: "Node {{ inventory_hostname }} ({{ ansible_host }}) connectivity check: {{ 'OK' if ping_result is succeeded else 'Failed' }}"
+
+- name: Check system resources
+  shell: |
+    echo "CPU Load: $(cat /proc/loadavg)"
+    echo "Memory Info: $(free -m | grep Mem)"
+    echo "Disk Space: $(df -h / | tail -n 1)"
+  register: system_resources
+  ignore_errors: true
+  when: ping_result is succeeded
+
+- name: Display system resources
+  debug:
+    var: system_resources.stdout_lines
+  when: system_resources is defined and system_resources.stdout_lines is defined
+
+- name: Skip unreachable nodes
+  meta: end_host
+  when: node_unreachable | bool
+
+- name: Ensure firewall allows SSH and Kubernetes ports
+  block:
+    - name: Check if ufw is installed
+      command: which ufw
+      register: ufw_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Configure firewall rules for Kubernetes
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      with_items:
+        - 22    # SSH
+        - 6443  # Kubernetes API server (external)
+        - 6444  # Kubernetes API server (internal)
+        - 2379  # etcd client
+        - 2380  # etcd peer
+        - 10250 # Kubelet API
+        - 10251 # kube-scheduler
+        - 10252 # kube-controller-manager
+      when: ufw_check.rc == 0
+  when: not node_unreachable | bool

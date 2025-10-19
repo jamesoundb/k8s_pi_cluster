@@ -1,0 +1,353 @@
+---
+# validate.yml - Tasks to validate etcd cluster health and configuration
+
+- name: Check if etcd is running
+  shell: crictl ps | grep etcd || echo "No etcd container running"
+  register: etcd_status
+  failed_when: false
+  changed_when: false
+
+- name: Display etcd container status
+  debug:
+    var: etcd_status.stdout_lines
+
+- name: Check if etcd ports are listening
+  shell: "ss -tulpn | grep {{ item }}"
+  register: etcd_ports
+  with_items:
+    - 2379
+    - 2380
+  failed_when: false
+  changed_when: false
+
+- name: Display etcd port status
+  debug:
+    msg: "{{ item.item }} port status: {{ 'LISTENING' if item.rc == 0 else 'NOT LISTENING' }}"
+  with_items: "{{ etcd_ports.results }}"
+
+- name: Check etcd container logs
+  shell: |
+    ETCD_ID=$(crictl ps -q --name etcd)
+    if [ -n "$ETCD_ID" ]; then
+      crictl logs --tail=30 $ETCD_ID
+    else
+      echo "No etcd container found"
+    fi
+  register: etcd_logs
+  changed_when: false
+
+- name: Display etcd logs
+  debug:
+    var: etcd_logs.stdout_lines
+
+- name: Check etcd health
+  shell: |
+    ETCDCTL_API=3 etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+      --cert=/etc/kubernetes/pki/etcd/server.crt \
+      --key=/etc/kubernetes/pki/etcd/server.key \
+      --endpoints=https://127.0.0.1:2379 endpoint health
+  register: etcd_health
+  failed_when: false
+  changed_when: false
+
+- name: Display etcd health
+  debug:
+    var: etcd_health.stdout_lines
+
+- name: Get etcd member list
+  shell: |
+    ETCDCTL_API=3 etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+      --cert=/etc/kubernetes/pki/etcd/server.crt \
+      --key=/etc/kubernetes/pki/etcd/server.key \
+      --endpoints=https://127.0.0.1:2379 member list -w table
+  register: etcd_members
+  failed_when: false
+  changed_when: false
+
+- name: Display etcd member list
+  debug:
+    var: etcd_members.stdout_lines
+
+- name: Validate etcd certificate configuration
+  shell: |
+    echo "Certificate validation for {{ ansible_host }}:"
+    
+    echo "=== Checking CA certificate ==="
+    if [ -f "/etc/kubernetes/pki/etcd/ca.crt" ]; then
+      echo "CA certificate exists"
+      openssl x509 -in /etc/kubernetes/pki/etcd/ca.crt -text -noout | grep -A1 "Subject:" | head -2
+      echo "Validity:"
+      openssl x509 -in /etc/kubernetes/pki/etcd/ca.crt -text -noout | grep -A2 "Validity"
+    else
+      echo "CA certificate missing!"
+    fi
+    
+    echo "=== Checking server certificate ==="
+    if [ -f "/etc/kubernetes/pki/etcd/server.crt" ]; then
+      echo "Server certificate exists"
+      echo "Subject:"
+      openssl x509 -in /etc/kubernetes/pki/etcd/server.crt -text -noout | grep -A1 "Subject:" | head -2
+      echo "Subject Alternative Names:"
+      openssl x509 -in /etc/kubernetes/pki/etcd/server.crt -text -noout | grep -A2 "Alternative"
+      echo "Issuer (should match CA Subject):"
+      openssl x509 -in /etc/kubernetes/pki/etcd/server.crt -text -noout | grep -A1 "Issuer:" | head -2
+      echo "Validity:"
+      openssl x509 -in /etc/kubernetes/pki/etcd/server.crt -text -noout | grep -A2 "Validity"
+      echo "Verifying server cert against CA:"
+      openssl verify -CAfile /etc/kubernetes/pki/etcd/ca.crt /etc/kubernetes/pki/etcd/server.crt || echo "Verification FAILED"
+    else
+      echo "Server certificate missing!"
+    fi
+    
+    echo "=== Checking peer certificate ==="
+    if [ -f "/etc/kubernetes/pki/etcd/peer.crt" ]; then
+      echo "Peer certificate exists"
+      echo "Subject:"
+      openssl x509 -in /etc/kubernetes/pki/etcd/peer.crt -text -noout | grep -A1 "Subject:" | head -2
+      echo "Subject Alternative Names:"
+      openssl x509 -in /etc/kubernetes/pki/etcd/peer.crt -text -noout | grep -A2 "Alternative"
+      echo "Issuer (should match CA Subject):"
+      openssl x509 -in /etc/kubernetes/pki/etcd/peer.crt -text -noout | grep -A1 "Issuer:" | head -2
+      echo "Validity:"
+      openssl x509 -in /etc/kubernetes/pki/etcd/peer.crt -text -noout | grep -A2 "Validity"
+      echo "Verifying peer cert against CA:"
+      openssl verify -CAfile /etc/kubernetes/pki/etcd/ca.crt /etc/kubernetes/pki/etcd/peer.crt || echo "Verification FAILED"
+    else
+      echo "Peer certificate missing!"
+    fi
+  register: cert_check
+  changed_when: false
+  failed_when: false
+
+- name: Display certificate validation results
+  debug:
+    var: cert_check.stdout_lines
+
+- name: Check if apiserver-etcd-client certificate exists and is valid
+  shell: |
+    echo "=== Checking API server to etcd client certificate ==="
+    if [ -f "/etc/kubernetes/pki/apiserver-etcd-client.crt" ] && [ -f "/etc/kubernetes/pki/apiserver-etcd-client.key" ]; then
+      echo "API server etcd client certificate exists"
+      echo "Subject:"
+      openssl x509 -in /etc/kubernetes/pki/apiserver-etcd-client.crt -text -noout | grep -A1 "Subject:" | head -2
+      echo "Issuer (should match etcd CA Subject):"
+      openssl x509 -in /etc/kubernetes/pki/apiserver-etcd-client.crt -text -noout | grep -A1 "Issuer:" | head -2
+      echo "Validity:"
+      openssl x509 -in /etc/kubernetes/pki/apiserver-etcd-client.crt -text -noout | grep -A2 "Validity"
+      echo "Verifying apiserver-etcd-client cert against etcd CA:"
+      openssl verify -CAfile /etc/kubernetes/pki/etcd/ca.crt /etc/kubernetes/pki/apiserver-etcd-client.crt || echo "Verification FAILED"
+    else
+      echo "API server etcd client certificate missing!"
+    fi
+  register: api_etcd_cert_check
+  changed_when: false
+  failed_when: false
+
+- name: Display API server etcd client certificate validation results
+  debug:
+    var: api_etcd_cert_check.stdout_lines
+
+- name: Test API server to etcd connectivity using curl
+  shell: |
+    if [ -f "/etc/kubernetes/pki/apiserver-etcd-client.crt" ] && [ -f "/etc/kubernetes/pki/apiserver-etcd-client.key" ]; then
+      echo "Testing API server to etcd connectivity (as if we were the API server):"
+      curl --cacert /etc/kubernetes/pki/etcd/ca.crt \
+           --cert /etc/kubernetes/pki/apiserver-etcd-client.crt \
+           --key /etc/kubernetes/pki/apiserver-etcd-client.key \
+           -s -o /dev/null -w "Response code: %{http_code}\n" \
+           https://127.0.0.1:2379/health
+    else
+      echo "Cannot test API server to etcd connectivity - certificates missing"
+    fi
+  register: api_etcd_conn_test
+  changed_when: false
+  failed_when: false
+
+- name: Display API server to etcd connectivity test results
+  debug:
+    var: api_etcd_conn_test.stdout_lines
+
+- name: Check multi-node etcd cluster health
+  shell: |
+    if [ {{ groups['k8s_master'] | length }} -gt 1 ]; then
+      ENDPOINTS="{% for host in groups['k8s_master'] %}https://{{ hostvars[host]['ansible_host'] }}:2379{% if not loop.last %},{% endif %}{% endfor %}"
+      echo "Checking etcd cluster health across all endpoints: $ENDPOINTS"
+      ETCDCTL_API=3 etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key \
+        --endpoints=$ENDPOINTS \
+        endpoint health --cluster || echo "Cluster health check failed"
+        
+      echo "Checking etcd cluster status:"
+      ETCDCTL_API=3 etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key \
+        --endpoints=$ENDPOINTS \
+        endpoint status -w table || echo "Cluster status check failed"
+    else
+      echo "Single node etcd cluster - skipping multi-node health check"
+    fi
+  register: etcd_cluster_health
+  changed_when: false
+  failed_when: false
+
+- name: Display etcd cluster health
+  debug:
+    var: etcd_cluster_health.stdout_lines
+  when: etcd_cluster_health is defined
+
+- name: Check etcd cluster quorum
+  shell: |
+    if [ {{ groups['k8s_master'] | length }} -gt 1 ]; then
+      echo "Checking etcd cluster quorum (should have at least {{ ((groups['k8s_master'] | length) // 2) + 1 }} healthy nodes):"
+      HEALTHY_COUNT=$(ETCDCTL_API=3 etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key \
+        --endpoints=https://127.0.0.1:2379 \
+        endpoint health --cluster 2>/dev/null | grep -c "is healthy")
+      TOTAL_NODES={{ groups['k8s_master'] | length }}
+      QUORUM=$(($TOTAL_NODES / 2 + 1))
+      echo "Healthy nodes: $HEALTHY_COUNT, Total nodes: $TOTAL_NODES, Quorum: $QUORUM"
+      if [ $HEALTHY_COUNT -ge $QUORUM ]; then
+        echo "Cluster has quorum"
+      else
+        echo "Cluster does NOT have quorum - this is a critical issue!"
+      fi
+    else
+      echo "Single node etcd cluster - quorum check not applicable"
+    fi
+  register: etcd_quorum
+  changed_when: false
+  failed_when: false
+
+- name: Display etcd quorum status
+  debug:
+    var: etcd_quorum.stdout_lines
+  when: etcd_quorum is defined
+
+- name: Check etcd data directory permissions
+  shell: |
+    echo "=== Checking etcd data directory permissions ==="
+    ls -la /var/lib/etcd | head -5
+    echo "Directory permissions: $(stat -c '%a' /var/lib/etcd)"
+    echo "Directory owner: $(stat -c '%U:%G' /var/lib/etcd)"
+    if [ "$(stat -c '%a' /var/lib/etcd)" != "700" ]; then
+      echo "WARNING: etcd data directory should have 700 permissions!"
+    fi
+  register: etcd_dir_check
+  changed_when: false
+  failed_when: false
+
+- name: Display etcd data directory permissions
+  debug:
+    var: etcd_dir_check.stdout_lines
+
+- name: Check if etcd data directory permissions are correct
+  shell: |
+    ls -la /var/lib/etcd | head -1
+  register: etcd_data_perms
+  changed_when: false
+
+- name: Display etcd data directory permissions
+  debug:
+    var: etcd_data_perms.stdout
+
+- name: Fix etcd data directory permissions if needed
+  file:
+    path: /var/lib/etcd
+    state: directory
+    mode: '0700'
+    owner: root
+    group: root
+  register: etcd_perms_fixed
+  changed_when: etcd_perms_fixed.changed
+
+- name: Restart kubelet if etcd data permissions were fixed
+  systemd:
+    name: kubelet
+    state: restarted
+  when: etcd_perms_fixed.changed
+
+- name: Verify connectivity between etcd nodes on peer ports
+  shell: |
+    {% for host in groups['k8s_master'] %}
+    {% if host != inventory_hostname %}
+    echo "Testing connection to {{ hostvars[host]['ansible_host'] }}:2380..."
+    timeout 5 bash -c "</dev/tcp/{{ hostvars[host]['ansible_host'] }}/2380" && echo "Success!" || echo "Failed!"
+    {% endif %}
+    {% endfor %}
+  register: peer_connectivity
+  changed_when: false
+  failed_when: false
+
+- name: Display etcd peer connectivity results
+  debug:
+    var: peer_connectivity.stdout_lines
+
+- name: Check full etcd cluster health (all nodes)
+  shell: |
+    {% if groups['k8s_master'] | length > 1 %}
+    echo "Checking full etcd cluster health across all {{ groups['k8s_master'] | length }} nodes..."
+    ETCDCTL_API=3 etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+      --cert=/etc/kubernetes/pki/etcd/server.crt \
+      --key=/etc/kubernetes/pki/etcd/server.key \
+      --endpoints={% for host in groups['k8s_master'] %}https://{{ hostvars[host]['ansible_host'] }}:2379{% if not loop.last %},{% endif %}{% endfor %} \
+      endpoint health --cluster
+    {% else %}
+    echo "Single node etcd cluster - checking local health only"
+    ETCDCTL_API=3 etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+      --cert=/etc/kubernetes/pki/etcd/server.crt \
+      --key=/etc/kubernetes/pki/etcd/server.key \
+      --endpoints=https://127.0.0.1:2379 \
+      endpoint health
+    {% endif %}
+  register: full_cluster_health
+  failed_when: false
+  changed_when: false
+  when: etcd_health.rc == 0
+
+- name: Display full cluster health status
+  debug:
+    var: full_cluster_health.stdout_lines
+  when: etcd_health.rc == 0 and full_cluster_health is defined
+
+- name: Check if all nodes have certificates properly configured
+  shell: |
+    # Check basic certificate files
+    ALL_CERTS_OK=true
+    echo "Checking etcd certificate files on {{ inventory_hostname }} ({{ ansible_host }})..."
+    
+    for cert_file in "ca.crt" "server.crt" "server.key" "peer.crt" "peer.key"; do
+      if [ ! -f "/etc/kubernetes/pki/etcd/${cert_file}" ]; then
+        echo "ERROR: Certificate file /etc/kubernetes/pki/etcd/${cert_file} is missing!"
+        ALL_CERTS_OK=false
+      else
+        echo "OK: /etc/kubernetes/pki/etcd/${cert_file} exists"
+      fi
+    done
+    
+    # Check API server client certificates
+    for cert_file in "apiserver-etcd-client.crt" "apiserver-etcd-client.key"; do
+      if [ ! -f "/etc/kubernetes/pki/${cert_file}" ]; then
+        echo "WARNING: API server client certificate /etc/kubernetes/pki/${cert_file} is missing!"
+        # Not failing on this, but warning
+      else
+        echo "OK: /etc/kubernetes/pki/${cert_file} exists"
+      fi
+    done
+    
+    # Report result
+    if [ "$ALL_CERTS_OK" = "true" ]; then
+      echo "All required certificate files exist"
+      exit 0
+    else
+      echo "Some certificate files are missing"
+      exit 1
+    fi
+  register: cert_files_check
+  changed_when: false
+  failed_when: cert_files_check.rc != 0
+  
+- name: Display certificate files check results
+  debug:
+    var: cert_files_check.stdout_lines

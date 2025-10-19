@@ -1,0 +1,292 @@
+---
+# Simplified and streamlined API server tasks
+
+# First let's debug the inventory groups to understand what tasks might be skipped
+- name: Debug inventory groups
+  debug:
+    msg: |
+      Node: {{ inventory_hostname }}
+      Groups: {{ group_names | join(', ') }}
+      Is master_init: {{ inventory_hostname in groups['k8s_master_init'] }}
+      Master init group: {{ groups['k8s_master_init'] | join(', ') }}
+      Is first master: {{ inventory_hostname == groups['k8s_master_init'][0] }}
+
+# 1. Install Kubernetes packages
+- name: Create keyring directory
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+- name: Add Kubernetes signing key
+  shell: |
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key | gpg --dearmor --batch --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  args:
+    warn: false
+  register: key_added
+  changed_when: key_added.rc == 0
+
+- name: Add Kubernetes repository with modern approach
+  block:
+    - name: Try Kubernetes 1.34 repository
+      apt_repository:
+        repo: deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /
+        state: present
+        filename: kubernetes
+        update_cache: true
+      register: repo_v129
+      ignore_errors: true
+    
+    - name: Try Kubernetes 1.33 repository if 1.34 fails
+      apt_repository:
+        repo: deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /
+        state: present
+        filename: kubernetes
+        update_cache: true
+      register: repo_v128
+      when: repo_v129 is failed
+      ignore_errors: true
+    
+    - name: Fall back to older repository if specific versions fail
+      apt_repository:
+        repo: deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.27/deb/ /
+        state: present
+        filename: kubernetes
+        update_cache: true
+      register: repo_v127
+      when: repo_v129 is failed and repo_v128 is failed
+      ignore_errors: true
+      
+    - name: Final fallback to manual download of packages
+      shell: |
+        mkdir -p /tmp/k8s-debs
+        cd /tmp/k8s-debs
+        apt-get update
+        apt-get download kubelet kubeadm kubectl
+        apt install -y ./kubelet*.deb ./kubeadm*.deb ./kubectl*.deb
+        apt-mark hold kubelet kubeadm kubectl
+      when: repo_v129 is failed and repo_v128 is failed and repo_v127 is failed
+      register: manual_install
+
+- name: Install Kubernetes components
+  apt:
+    name:
+      - kubelet
+      - kubeadm
+      - kubectl
+    state: present
+    update_cache: true
+  register: kube_install
+  retries: 5
+  delay: 20
+  until: kube_install is success
+
+- name: Hold Kubernetes packages
+  dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+
+# 2. Configure kubelet
+- name: Create kubelet configuration directory
+  file:
+    path: /etc/systemd/system/kubelet.service.d
+    state: directory
+    mode: '0755'
+
+- name: Configure kubelet to use containerd
+  copy:
+    dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+    content: |
+      [Service]
+      Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock"
+    mode: '0644'
+
+- name: Configure crictl to use containerd
+  copy:
+    dest: /etc/crictl.yaml
+    content: |
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+      timeout: 10
+      debug: false
+    mode: '0644'
+
+- name: Restart kubelet service
+  systemd:
+    name: kubelet
+    state: restarted
+    daemon_reload: yes
+    enabled: yes
+
+# 3. Generate certificates for API server
+- name: Verify etcd certificates exist
+  stat:
+    path: "/etc/kubernetes/pki/etcd/{{ item }}"
+  loop:
+    - ca.crt
+    - server.crt
+    - server.key
+  register: etcd_certs
+
+- name: Generate apiserver-etcd-client private key
+  shell: |
+    kubeadm init phase certs apiserver-etcd-client --cert-dir=/etc/kubernetes/pki --config=/etc/kubernetes/kubeadm/kubeadm-init.yaml
+  when: not etcd_certs.results[0].stat.exists or not etcd_certs.results[1].stat.exists or not etcd_certs.results[2].stat.exists
+
+# 3.5 Ensure API server to etcd client certificates
+- name: Ensure API server to etcd client certificates exist
+  include_tasks: ensure_etcd_client_certs.yml
+
+# 4. Create kubeadm config
+- name: Create kubernetes and kubeadm directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  with_items:
+    - /etc/kubernetes
+    - /etc/kubernetes/pki
+    - /etc/kubernetes/kubeadm
+    
+- name: Create kubeadm init configuration
+  template:
+    src: templates/kubeadm-init.yaml.j2
+    dest: /etc/kubernetes/kubeadm/kubeadm-init.yaml
+    mode: '0644'
+  register: kubeadm_config
+
+# Validate the kubeadm configuration
+- name: Validate kubeadm configuration
+  shell: kubeadm config validate --config /etc/kubernetes/kubeadm/kubeadm-init.yaml --v=5 || echo "Failed to validate"
+  register: kubeadm_validate
+  changed_when: false
+
+- name: Display kubeadm validation result
+  debug:
+    var: kubeadm_validate.stdout_lines
+
+- name: Get detailed kubeadm validation if failed
+  shell: kubeadm config validate --config /etc/kubernetes/kubeadm/kubeadm-init.yaml --v=5 2>&1 || true
+  register: kubeadm_validate_details
+  when: "'Failed to validate' in kubeadm_validate.stdout"
+  
+- name: Show detailed validation errors
+  debug:
+    var: kubeadm_validate_details.stdout_lines
+  when: kubeadm_validate_details is defined and kubeadm_validate_details.stdout_lines is defined
+  
+- name: Fail if kubeadm validation failed
+  fail:
+    msg: "Kubeadm configuration validation failed. Please check the kubeadm-init.yaml file for formatting errors."
+  when: "'Failed to validate' in kubeadm_validate.stdout"
+
+# 5. Initialize Kubernetes
+- name: Check if Kubernetes is already initialized
+  stat:
+    path: /etc/kubernetes/admin.conf
+  register: admin_conf
+
+- name: Check if Kubernetes API server is already running
+  shell: crictl ps -a | grep kube-apiserver || echo "No kube-apiserver running"
+  register: apiserver_running
+  changed_when: false
+  failed_when: false
+
+- name: Reset Kubernetes if admin.conf is missing but API server was previously attempted
+  block:
+    - name: Run kubeadm reset
+      shell: kubeadm reset --force
+      register: kubeadm_reset
+      when: "'kube-apiserver' in apiserver_running.stdout"
+    
+    - name: Clean up etcd data directory
+      file:
+        path: /var/lib/etcd
+        state: absent
+      when: kubeadm_reset is changed
+    
+    - name: Recreate etcd data directory
+      file:
+        path: /var/lib/etcd
+        state: directory
+        mode: '0700'
+      when: kubeadm_reset is changed
+  when: not admin_conf.stat.exists
+
+- name: Check for port conflicts
+  include_tasks: check_ports.yml
+
+- name: Run kubeadm init
+  shell: |
+    kubeadm init --config=/etc/kubernetes/kubeadm/kubeadm-init.yaml {{ kubeadm_ignore_flags }} --v=5 --upload-certs 2>&1 | tee /var/log/kubeadm-init.log
+  register: kubeadm_init
+  when: not admin_conf.stat.exists
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  
+- name: Display kubeadm init output
+  debug:
+    msg: "{{ kubeadm_init.stdout_lines | default([]) }}"
+  when: kubeadm_init is changed
+
+- name: Display kubeadm init output
+  debug:
+    var: kubeadm_init.stdout_lines
+  when: kubeadm_init is defined and kubeadm_init.stdout_lines is defined
+
+# 6. Validate and fix API server manifest
+- name: Validate and fix API server manifest
+  include_tasks: validate_manifest.yml
+
+# 7. Configure kubeconfig
+- name: Create directory for kubeconfig
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - /root/.kube
+    - "/home/{{ ansible_user }}/.kube"
+
+- name: Set up kubeconfig for root user
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/.kube/config
+    remote_src: yes
+    mode: '0600'
+  when: admin_conf.stat.exists
+
+- name: Set up kubeconfig for regular user
+  copy:
+    src: /etc/kubernetes/admin.conf
+    dest: "/home/{{ ansible_user }}/.kube/config"
+    remote_src: yes
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: '0600'
+  when: admin_conf.stat.exists
+
+# 8. Verify API server is running
+- name: Check if API server container is running
+  shell: |
+    crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps | grep kube-apiserver | grep -v grep || echo "API server not running"
+  register: api_status
+  ignore_errors: true
+  changed_when: false
+
+- name: Wait for API server to be ready
+  shell: |
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw='/healthz'
+  register: api_health
+  until: api_health.rc == 0
+  retries: 5
+  delay: 10
+  ignore_errors: true
+
+- name: Display API server status
+  debug:
+    msg: "API server is {{ 'running' if api_status.rc == 0 else 'not running' }}, health check: {{ api_health.stdout | default('failed') }}"

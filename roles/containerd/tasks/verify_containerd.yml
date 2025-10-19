@@ -1,0 +1,142 @@
+---
+# Tasks to verify containerd is properly installed and running
+
+- name: Check if containerd service is active
+  systemd:
+    name: containerd
+    state: started
+    enabled: yes
+  register: containerd_status
+  ignore_errors: true
+
+- name: Display containerd status
+  debug:
+    msg: "Containerd service is {{ 'running' if containerd_status.status.ActiveState == 'active' else 'not running' }}"
+  when: containerd_status.status is defined
+
+- name: Check for containerd socket
+  stat:
+    path: /run/containerd/containerd.sock
+  register: containerd_socket
+
+- name: Display socket status
+  debug:
+    msg: "Containerd socket {{ 'exists' if containerd_socket.stat.exists else 'does not exist' }}"
+    
+- name: Check if kubelet is configured to use containerd
+  stat:
+    path: /etc/default/kubelet
+  register: kubelet_config_file
+  
+- name: Verify kubelet configuration for containerd
+  shell: grep -q "KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock" /etc/default/kubelet
+  register: kubelet_containerd_config
+  changed_when: false
+  failed_when: false
+  when: kubelet_config_file.stat.exists
+
+- name: Reinstall containerd if socket doesn't exist
+  block:
+    - name: Stop kubelet service
+      systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: true
+      
+    - name: Remove previous containerd installation
+      apt:
+        name: containerd
+        state: absent
+        purge: yes
+        force: yes
+      
+    - name: Clean up containerd configuration directory
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /etc/containerd
+        - /var/lib/containerd
+        - /run/containerd
+      
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        
+    - name: Install containerd from Ubuntu repository
+      apt:
+        name: containerd
+        state: present
+        install_recommends: yes
+        
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+        
+    - name: Generate default containerd configuration
+      shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+        
+    - name: Configure containerd for Kubernetes
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+        
+    - name: Restart containerd service
+      systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+        
+    - name: Wait for containerd socket to be created
+      wait_for:
+        path: /run/containerd/containerd.sock
+        state: present
+        timeout: 60
+  when: not containerd_socket.stat.exists or not containerd_status.status.ActiveState == 'active'
+
+- name: Verify containerd is now running correctly
+  shell: ctr --address /run/containerd/containerd.sock version
+  register: containerd_version
+  ignore_errors: true
+
+- name: Display containerd version
+  debug:
+    var: containerd_version.stdout_lines
+  when: containerd_version.stdout is defined
+  
+- name: Ensure kubelet is configured to use containerd
+  blockinfile:
+    path: /etc/default/kubelet
+    create: yes
+    block: |
+      Environment="KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock"
+  
+- name: Configure crictl to use containerd
+  copy:
+    dest: /etc/crictl.yaml
+    content: |
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+      timeout: 10
+      debug: false
+
+- name: Final validation - Check if containerd can list images 
+  shell: ctr --address /run/containerd/containerd.sock images list || echo "failed"
+  register: containerd_images_check
+  ignore_errors: true
+
+- name: Display final containerd validation status
+  debug:
+    msg: "Containerd is {{ 'fully operational' if 'failed' not in containerd_images_check.stdout else 'still having issues' }}"
+
+- name: Fail if containerd is still not working properly
+  fail:
+    msg: "Containerd is still not working properly after fix attempts. Manual intervention may be needed."
+  when: "'failed' in containerd_images_check.stdout"
+  ignore_errors: true
