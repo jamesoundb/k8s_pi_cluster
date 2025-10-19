@@ -6,6 +6,8 @@ discussion, and no code or changes to files should occur.
 - When I use /code in my prompt, know that I would like to write code.
 - When I use /change in my prompt, know that I would like to only have the last code 
 change to be made, and I need no additional explainations about the change.
+- When using git run git status first to gain scope of all files, then group commits
+together with like files for code changes. Use concise commit messages.
 
 # Project Specific instructions
 Deployment Philosophy and File Organization
