@@ -77,7 +77,7 @@
         spec:
           containers:
           - name: kube-proxy
-            image: registry.k8s.io/kube-proxy:v1.29.0
+            image: registry.k8s.io/kube-proxy:v{{ k8s_version }}
             imagePullPolicy: IfNotPresent
             command:
             - /usr/local/bin/kube-proxy

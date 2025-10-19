@@ -6,7 +6,7 @@
   hosts: k8s_nodes
   become: true
   vars:
-    k8s_version: "1.29.0"
+    k8s_version: "{{ k8s_version | default('1.34.1') }}"
     k8s_username: "{{ ansible_user }}"
   
   tasks:
@@ -77,12 +77,12 @@
         mode: '0755'
     
     - name: Add Kubernetes apt key
-      shell: curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      shell: curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
       args:
         creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
     
     - name: Add Kubernetes apt repository
-      shell: echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+      shell: echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
       args:
         creates: /etc/apt/sources.list.d/kubernetes.list
     

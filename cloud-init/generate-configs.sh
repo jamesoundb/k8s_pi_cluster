@@ -2,6 +2,15 @@
 
 # Script to generate cloud-init configuration files from templates
 
+# Check if running in test mode
+TEST_ONLY=false
+if [[ "$1" == "--test-only" ]]; then
+  TEST_ONLY=true
+  echo "Running in test-only mode"
+  # Use a pre-defined key for testing
+  TEST_SSH_KEY="ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC6VJ+OAWwz4kM7jgvPRpriQ9aLCkV4Q8WU8qY7E/2TzU2xW6KYvF/Rd2E6cS8EQCwtgDqZKw/HRJH+rpWk4TW4jZY9j2z8XCFwQhiEz0EkCMBhqjM4DBNF/FgdSpzTGklWvwFfE1PfMpAhPT+/aODdSgOJEX9zBg6QGFcWNFrpUy9H9iHJnA7BNalevFhlLnbOyI+90cVm6E/CqKXNNo6t5ZJwCwBUdwpKBrQ3xLMDkHMXUpT8Ow2LxZgbgj/lpmOk7ALCeUDRTPYv3cAGklr6Wwym/gh62A1qgUvYQCs4/JfWLEVNCRUFKQ3ET6nIgBTqDkhQP69bwM6dpWOtRV/v test@testkey"
+fi
+
 # Define node configurations
 declare -A nodes
 nodes=(
@@ -12,6 +21,13 @@ nodes=(
 
 # SSH key generation or selection
 generate_or_select_key() {
+  # Skip interactive prompts in test mode
+  if [ "$TEST_ONLY" = true ]; then
+    echo "Test mode: Using predefined SSH key"
+    ssh_public_key="$TEST_SSH_KEY"
+    return
+  fi
+
   echo "===== SSH Key Configuration ====="
   echo "This script will need an SSH key to configure access to your Kubernetes nodes."
   echo ""

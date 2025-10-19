@@ -1,7 +1,7 @@
 ---
 # CNI Network Plugin Installation Playbook
-# This playbook handles the installation of Flannel CNI after the first control plane node is ready
-# Run this after first-control-plane.yml has successfully completed
+# This playbook handles the installation of Flannel CNI after the control plane initialization
+# Run this after bootstrap-control-plane.yml has successfully completed
 
 - name: Install Flannel CNI Network Plugin
   hosts: k8s_master_init
@@ -9,9 +9,18 @@
   vars:
     pod_network_cidr: "10.244.0.0/16"
     k8s_username: "{{ ansible_user }}"
-    api_endpoint_address: "{{ ansible_host }}"  # Use the actual node IP for direct connection
+    api_endpoint_address: "{{ hostvars[groups['k8s_master_init'][0]]['ansible_default_ipv4']['address'] }}"
+    control_plane_endpoint: "192.168.1.100"
+    api_server_port: "6443"
+    keepalived_auth_pass: "K8sVIP"
   
   tasks:
+    # Verify and fix etcd before proceeding
+    - name: Verify etcd is healthy before CNI deployment
+      include_role:
+        name: etcd
+        tasks_from: verify
+      
     # First verify that we have a running API server with proper authentication
     - name: Check if admin.conf exists
       stat:
@@ -28,7 +37,13 @@
       when: not admin_conf_stat.stat.exists
     
     # Create kubeconfig directory for the user if needed
-    - name: Ensure .kube directory exists
+    - name: Ensure .kube directory exists for root
+      file:
+        path: "/root/.kube"
+        state: directory
+        mode: '0755'
+
+    - name: Ensure .kube directory exists for regular user
       file:
         path: "/home/{{ k8s_username }}/.kube"
         state: directory
@@ -39,158 +54,140 @@
     - name: Copy admin.conf to user's kubeconfig if needed
       copy:
         src: /etc/kubernetes/admin.conf
-        dest: "/home/{{ k8s_username }}/.kube/config"
+        dest: "{{ item.dest }}"
         remote_src: yes
-        owner: "{{ k8s_username }}"
-        group: "{{ k8s_username }}"
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
         mode: '0600'
+      with_items:
+        - { dest: "/root/.kube/config", owner: "root", group: "root" }
+        - { dest: "/home/{{ k8s_username }}/.kube/config", owner: "{{ k8s_username }}", group: "{{ k8s_username }}" }
       when: admin_conf_stat.stat.exists
     
-    # Wait for API server to be ready
+    # Make sure HAProxy and keepalived are correctly configured before proceeding
+    - name: Verify and fix HAProxy and keepalived configuration
+      block:
+        # Fix HAProxy configuration if needed
+        - name: Check HAProxy configuration
+          stat:
+            path: /etc/haproxy/haproxy.cfg
+          register: haproxy_cfg
+          
+        - name: Ensure HAProxy backends use port 6443
+          replace:
+            path: /etc/haproxy/haproxy.cfg
+            regexp: '(server\s+apiserver\d+\s+[\d\.]+):6444'
+            replace: '\1:6443'
+          when: haproxy_cfg.stat.exists
+          register: haproxy_updated
+          
+        - name: Restart HAProxy if configuration changed
+          systemd:
+            name: haproxy
+            state: restarted
+            enabled: yes
+          when: haproxy_updated is defined and haproxy_updated.changed
+          
+        # Fix keepalived configuration if needed  
+        - name: Check keepalived configuration
+          stat:
+            path: /etc/keepalived/keepalived.conf
+          register: keepalived_cfg
+          
+        - name: Ensure keepalived uses the correct authentication password
+          replace:
+            path: /etc/keepalived/keepalived.conf
+            regexp: 'auth_pass\s+\w+'
+            replace: 'auth_pass {{ keepalived_auth_pass }}'
+          when: keepalived_cfg.stat.exists
+          register: keepalived_updated
+          
+        - name: Restart keepalived if configuration changed
+          systemd:
+            name: keepalived
+            state: restarted
+            enabled: yes
+          when: keepalived_updated is defined and keepalived_updated.changed
+          
+        - name: Wait for services to stabilize
+          pause:
+            seconds: 5
+          when: haproxy_updated.changed or keepalived_updated.changed
+    
+    # Wait for API server to be ready with robust checking
     - name: Wait for API server to be ready
+      block:
+        - name: Check if API server is accessible via VIP
+          shell: curl -k https://{{ control_plane_endpoint }}:{{ api_server_port | default('6443') }}/healthz || echo "not ready"
+          register: vip_api_health
+          retries: 5
+          delay: 10
+          until: vip_api_health.stdout == "ok"
+          ignore_errors: true
+          
+        - name: Check if API server is accessible via localhost
+          shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw='/healthz' || echo "not ready"
+          register: local_api_health
+          retries: 12
+          delay: 5
+          until: local_api_health.stdout == "ok"
+          ignore_errors: true
+          
+        - name: Set combined health status
+          set_fact:
+            combined_health: "{{ (vip_api_health.stdout is defined and vip_api_health.stdout == 'ok') or (local_api_health.stdout is defined and local_api_health.stdout == 'ok') }}"
+    
+    - name: Display API server health status
+      debug:
+        msg: >
+          API server health status: {{ combined_health | default(false) | ternary('healthy', 'not healthy') }}
+          VIP endpoint ({{ control_plane_endpoint }}:{{ api_server_port | default('6443') }}): {{ vip_api_health.stdout | default('not available') }}
+          Local endpoint: {{ local_api_health.stdout | default('not available') }}
+    
+    - name: Verify nodes are registered
       shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes
-      register: api_ready
-      retries: 10
-      delay: 5
-      until: api_ready.rc == 0
+      register: nodes
       ignore_errors: true
-    
-    - name: Display API server readiness status
+      
+    - name: Display nodes
       debug:
-        msg: "API server is ready: {{ api_ready.rc == 0 }}"
-        
-    # Check if kube-apiserver.yaml exists, if not restore from backup
-    - name: Check if kube-apiserver manifest exists
-      stat:
-        path: /etc/kubernetes/manifests/kube-apiserver.yaml
-      register: api_manifest_stat
+        var: nodes.stdout_lines
     
-    - name: Check if kube-apiserver backup exists
-      stat:
-        path: /etc/kubernetes/manifests/kube-apiserver.yaml.bak
-      register: api_backup_stat
-      when: not api_manifest_stat.stat.exists
+    # Instead of moving manifest files around, use our sync_apiserver_config task
+    - name: Synchronize API server configuration
+      include_role:
+        name: ../roles/kube_apiserver
+        tasks_from: sync_apiserver_config
     
-    - name: Restore kube-apiserver manifest from backup if needed
-      copy:
-        src: /etc/kubernetes/manifests/kube-apiserver.yaml.bak
-        dest: /etc/kubernetes/manifests/kube-apiserver.yaml
-        remote_src: yes
-        mode: '0644'
-      when: not api_manifest_stat.stat.exists and api_backup_stat.stat.exists
-      register: restored_api_manifest
-    
-    - name: Wait for API server to restart after restoring manifest
-      pause:
-        seconds: 30
-      when: restored_api_manifest is changed
-    
-    # Ensure consistent port configuration in Kubernetes components
-    - name: Verify API server is configured correctly
-      shell: "grep -o 'secure-port=6444' /etc/kubernetes/manifests/kube-apiserver.yaml || echo 'not-configured'"
-      register: api_port_check
-      ignore_errors: true
-      
-    - name: Analyze API server port configuration
-      debug:
-        msg: "API server port configuration: {{ 'Correct (6444)' if 'secure-port=6444' in api_port_check.stdout else 'Incorrect (not set to 6444)' }}"
-
-    # Update API server manifest if needed
-    - name: Backup kube-apiserver manifest
-      copy:
-        src: /etc/kubernetes/manifests/kube-apiserver.yaml
-        dest: /etc/kubernetes/manifests/kube-apiserver.yaml.bak
-        remote_src: yes
-        mode: '0644'
-      
-    - name: Move kube-apiserver manifest out temporarily to make edits
-      command: mv /etc/kubernetes/manifests/kube-apiserver.yaml /etc/kubernetes/kube-apiserver.yaml.tmp
-      
-    # Fix the malformed t44 lines in annotations
-    - name: Fix malformed annotations in API server manifest
-      replace:
-        path: /etc/kubernetes/kube-apiserver.yaml.tmp
-        regexp: '  annotations:\nt44'
-        replace: '  annotations:'
-      
-    # Fix the malformed t44 lines in livenessProbe
-    - name: Fix malformed livenessProbe in API server manifest
-      replace:
-        path: /etc/kubernetes/kube-apiserver.yaml.tmp
-        regexp: '        path: /livez\nt44\n        scheme: HTTPS'
-        replace: '        path: /livez\n        port: 6444\n        scheme: HTTPS'
-      
-    # Fix the malformed t44 lines in readinessProbe
-    - name: Fix malformed readinessProbe in API server manifest
-      replace:
-        path: /etc/kubernetes/kube-apiserver.yaml.tmp
-        regexp: '        path: /readyz\nt44\n        scheme: HTTPS'
-        replace: '        path: /readyz\n        port: 6444\n        scheme: HTTPS'
-      
-    # Fix the malformed t44 lines in startupProbe
-    - name: Fix malformed startupProbe in API server manifest
-      replace:
-        path: /etc/kubernetes/kube-apiserver.yaml.tmp
-        regexp: '        path: /livez\nt44\n        scheme: HTTPS'
-        replace: '        path: /livez\n        port: 6444\n        scheme: HTTPS'
-      
-    - name: Update API server secure port in manifest (if needed)
-      replace:
-        path: /etc/kubernetes/kube-apiserver.yaml.tmp
-        regexp: '--secure-port=6443'
-        replace: '--secure-port=6444'
-      ignore_errors: true
-      
-    - name: Move kube-apiserver manifest back to trigger restart
-      command: mv /etc/kubernetes/kube-apiserver.yaml.tmp /etc/kubernetes/manifests/kube-apiserver.yaml
-      when: api_port_check.stdout == 'not-configured'
-      
-    # Check and update all kubeconfig files
+    # Check and update all kubeconfig files - this time with correct port
     - name: Gather all kubeconfig files
       find:
         paths: /etc/kubernetes
         patterns: "*.conf"
       register: kubeconfig_files
 
-    - name: Check each kubeconfig file
-      shell: "grep -o 'server: https://.*:6443' {{ item.path }} || echo 'correctly-configured'"
-      register: kubeconfig_checks
+    - name: Update kubeconfig files to use correct port
+      replace:
+        path: "{{ item.path }}"
+        regexp: 'server: https://[0-9.]+:6444'
+        replace: 'server: https://{{ control_plane_endpoint }}:{{ api_server_port }}'
       with_items: "{{ kubeconfig_files.files }}"
       loop_control:
         label: "{{ item.path }}"
-      ignore_errors: true
-      
-    - name: Update kubeconfig files that use incorrect port
-      replace:
-        path: "{{ item.item.path }}"
-        regexp: 'server: https://.*:6443'
-        replace: 'server: https://{{ api_endpoint_address }}:6444'
-      with_items: "{{ kubeconfig_checks.results }}"
-      when: item.stdout != 'correctly-configured'
-      loop_control:
-        label: "{{ item.item.path }}"
       register: kubeconfig_updates
 
-    # Also check and update the user's kubeconfig
-    - name: Check user kubeconfig
-      stat:
-        path: "/home/{{ k8s_username }}/.kube/config"
-      register: user_kubeconfig
-    
-    - name: Update user kubeconfig if it exists
-      replace:
-        path: "/home/{{ k8s_username }}/.kube/config"
-        regexp: 'server: https://.*:6443'
-        replace: 'server: https://{{ api_endpoint_address }}:6444'
-      when: user_kubeconfig.stat.exists
-      register: user_kubeconfig_updated
-
     # Restart kubelet if any kubeconfig files were updated
-    - name: Restart kubelet to pick up configuration changes
+    - name: Restart kubelet if configurations were updated
       systemd:
         name: kubelet
         state: restarted
-      when: kubeconfig_updates is changed or user_kubeconfig_updated is changed
+      when: kubeconfig_updates.changed
+      register: kubelet_restarted
+      
+    - name: Wait for kubelet to settle after restart
+      pause:
+        seconds: 10
+      when: kubelet_restarted is changed
       
     # Download Flannel manifest
     - name: Create temporary directory for CNI manifests
@@ -200,295 +197,320 @@
         mode: '0755'
     
     - name: Download Flannel manifest using curl
-      shell: curl -L -o /tmp/flannel/kube-flannel.yml https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
-      args:
-        creates: /tmp/flannel/kube-flannel.yml
+      shell: curl -L --insecure https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml -o /tmp/flannel/kube-flannel.yml
       register: flannel_download
-      ignore_errors: true
+      retries: 3
+      delay: 5
+      until: flannel_download.rc == 0
       
-    # Check if flannel manifest exists after download attempt
-    - name: Check if flannel manifest file exists
+    - name: Verify download succeeded
       stat:
         path: /tmp/flannel/kube-flannel.yml
       register: flannel_file
-
-    # Fallback if download fails
-    - name: Create Flannel manifest from template if download failed
-      copy:
-        dest: /tmp/flannel/kube-flannel.yml
-        content: |
-          ---
-          kind: Namespace
-          apiVersion: v1
-          metadata:
-            name: kube-flannel
-            labels:
-              pod-security.kubernetes.io/enforce: privileged
-          ---
-          kind: ClusterRole
-          apiVersion: rbac.authorization.k8s.io/v1
-          metadata:
-            name: flannel
-          rules:
-          - apiGroups:
-              - ""
-            resources:
-              - pods
-            verbs:
-              - get
-          - apiGroups:
-              - ""
-            resources:
-              - nodes
-            verbs:
-              - list
-              - watch
-          - apiGroups:
-              - ""
-            resources:
-              - nodes/status
-            verbs:
-              - patch
-          ---
-          kind: ClusterRoleBinding
-          apiVersion: rbac.authorization.k8s.io/v1
-          metadata:
-            name: flannel
-          roleRef:
-            apiGroup: rbac.authorization.k8s.io
-            kind: ClusterRole
-            name: flannel
-          subjects:
-          - kind: ServiceAccount
-            name: flannel
-            namespace: kube-flannel
-          ---
-          apiVersion: v1
-          kind: ServiceAccount
-          metadata:
-            name: flannel
-            namespace: kube-flannel
-          ---
-          kind: ConfigMap
-          apiVersion: v1
-          metadata:
-            name: kube-flannel-cfg
-            namespace: kube-flannel
-            labels:
-              tier: node
-              app: flannel
-          data:
-            cni-conf.json: |
-              {
-                "name": "cbr0",
-                "cniVersion": "0.3.1",
-                "plugins": [
-                  {
-                    "type": "flannel",
-                    "delegate": {
-                      "hairpinMode": true,
-                      "isDefaultGateway": true
-                    }
-                  },
-                  {
-                    "type": "portmap",
-                    "capabilities": {
-                      "portMappings": true
-                    }
-                  }
-                ]
-              }
-            net-conf.json: |
-              {
-                "Network": "{{ pod_network_cidr }}",
-                "Backend": {
-                  "Type": "vxlan"
-                }
-              }
-          ---
-          apiVersion: apps/v1
-          kind: DaemonSet
-          metadata:
-            name: kube-flannel-ds
-            namespace: kube-flannel
-            labels:
-              tier: node
-              app: flannel
-          spec:
-            selector:
-              matchLabels:
-                app: flannel
-            template:
-              metadata:
-                labels:
-                  tier: node
-                  app: flannel
-              spec:
-                affinity:
-                  nodeAffinity:
-                    requiredDuringSchedulingIgnoredDuringExecution:
-                      nodeSelectorTerms:
-                      - matchExpressions:
-                        - key: kubernetes.io/os
-                          operator: In
-                          values:
-                          - linux
-                hostNetwork: true
-                tolerations:
-                - operator: Exists
-                  effect: NoSchedule
-                # Add specific tolerations for control plane nodes
-                - key: node-role.kubernetes.io/control-plane
-                  operator: Exists
-                  effect: NoSchedule
-                - key: node-role.kubernetes.io/master
-                  operator: Exists
-                  effect: NoSchedule
-                serviceAccountName: flannel
-                initContainers:
-                - name: install-cni-plugin
-                  image: docker.io/flannel/flannel-cni-plugin:v1.1.2
-                  command:
-                  - cp
-                  args:
-                  - -f
-                  - /flannel
-                  - /opt/cni/bin/flannel
-                  volumeMounts:
-                  - name: cni-plugin
-                    mountPath: /opt/cni/bin
-                - name: install-cni
-                  image: docker.io/flannel/flannel:v0.22.0
-                  command:
-                  - cp
-                  args:
-                  - -f
-                  - /etc/kube-flannel/cni-conf.json
-                  - /etc/cni/net.d/10-flannel.conflist
-                  volumeMounts:
-                  - name: cni
-                    mountPath: /etc/cni/net.d
-                  - name: flannel-cfg
-                    mountPath: /etc/kube-flannel/
-                containers:
-                - name: kube-flannel
-                  image: docker.io/flannel/flannel:v0.22.0
-                  command:
-                  - /opt/bin/flanneld
-                  args:
-                  - --ip-masq
-                  - --kube-subnet-mgr
-                  - --iface=eth0
-                  resources:
-                    requests:
-                      cpu: "100m"
-                      memory: "50Mi"
-                    limits:
-                      cpu: "100m"
-                      memory: "50Mi"
-                  securityContext:
-                    privileged: false
-                    capabilities:
-                      add: ["NET_ADMIN", "NET_RAW"]
-                  env:
-                  - name: POD_NAME
-                    valueFrom:
-                      fieldRef:
-                        fieldPath: metadata.name
-                  - name: POD_NAMESPACE
-                    valueFrom:
-                      fieldRef:
-                        fieldPath: metadata.namespace
-                  - name: EVENT_QUEUE_DEPTH
-                    value: "5000"
-                  volumeMounts:
-                  - name: run
-                    mountPath: /run/flannel
-                  - name: flannel-cfg
-                    mountPath: /etc/kube-flannel/
-                  - name: xtables-lock
-                    mountPath: /run/xtables.lock
-                volumes:
-                - name: run
-                  hostPath:
-                    path: /run/flannel
-                - name: cni-plugin
-                  hostPath:
-                    path: /opt/cni/bin
-                - name: cni
-                  hostPath:
-                    path: /etc/cni/net.d
-                - name: flannel-cfg
-                  configMap:
-                    name: kube-flannel-cfg
-                - name: xtables-lock
-                  hostPath:
-                    path: /run/xtables.lock
-                    type: FileOrCreate
-        owner: root
-        group: root
-        mode: '0644'
-      when: flannel_download is failed
-    
-    # Apply network configuration
-    - name: Apply Flannel network configuration
-      become: true
-      become_user: "{{ k8s_username }}"
-      shell: kubectl --kubeconfig=/home/{{ k8s_username }}/.kube/config apply -f /tmp/flannel/kube-flannel.yml
-      register: flannel_apply
-      retries: 5
-      delay: 10
-      until: flannel_apply.rc == 0
-      ignore_errors: true
-    
-    - name: Display Flannel installation status
-      debug:
-        var: flannel_apply
-        verbosity: 1
-
-    # Wait for Flannel pods to be ready
-    - name: Wait for Flannel pods to start
-      become: true
-      become_user: "{{ k8s_username }}"
-      shell: kubectl --kubeconfig=/home/{{ k8s_username }}/.kube/config get pods -n kube-flannel -o wide
-      register: flannel_pods
-      retries: 10
-      delay: 5
-      until: "'Running' in flannel_pods.stdout"
-      ignore_errors: true
       
-    - name: Display Flannel pods status
-      debug:
-        var: flannel_pods.stdout_lines
+    - name: Create backup of original Flannel manifest
+      copy:
+        src: /tmp/flannel/kube-flannel.yml
+        dest: /tmp/flannel/kube-flannel.yml.orig
+        remote_src: yes
+        mode: '0644'
+      when: flannel_file.stat.exists
+      
+    # Update the Flannel manifest with correct pod CIDR
+    - name: Update Pod CIDR in Flannel manifest
+      replace:
+        path: /tmp/flannel/kube-flannel.yml
+        regexp: 'net-conf.json: \|\n\s+{\n\s+"Network": "10\.[0-9]+\.[0-9]+\.[0-9]+/16"'
+        replace: 'net-conf.json: |\n      {\n        "Network": "{{ pod_network_cidr }}"'
+      when: flannel_download is succeeded
     
-    # Verify network functionality
-    - name: Check node network status
-      become: true
-      become_user: "{{ k8s_username }}"
-      shell: kubectl --kubeconfig=/home/{{ k8s_username }}/.kube/config get nodes -o wide
-      register: nodes_status
+    # Apply the CNI network plugin
+    - name: Apply Flannel CNI - first attempt
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /tmp/flannel/kube-flannel.yml
+      register: flannel_apply
+      ignore_errors: true
+    
+    - name: Display Flannel application result
+      debug:
+        var: flannel_apply.stdout_lines
+    
+    # Add retry logic for CNI application
+    - name: Wait and retry if Flannel apply failed
+      block:
+        - name: Pause before retrying
+          pause:
+            seconds: 15
+          
+        - name: Retry Flannel application
+          shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /tmp/flannel/kube-flannel.yml
+          register: flannel_retry
+          
+        - name: Display retry result
+          debug:
+            var: flannel_retry.stdout_lines
+      when: flannel_apply.rc != 0
+      
+    # Wait for Flannel pods to be ready
+    - name: Wait for Flannel pods to be ready
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-flannel -l app=flannel | grep -c "Running" || echo "0"
+      register: flannel_pods_ready
+      retries: 20
+      delay: 10
+      until: flannel_pods_ready.stdout | int > 0
+      ignore_errors: true
+    
+    - name: Display Flannel pod status
+      debug:
+        msg: "Flannel pods running: {{ flannel_pods_ready.stdout }}"
+    
+    # Verify pod and node networking is working
+    - name: Get node status
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide
+      register: node_status
       
     - name: Display node network status
       debug:
-        var: nodes_status.stdout_lines
-
-    # Install CNI plugins if needed
-    - name: Ensure CNI plugins directory exists
-      file:
-        path: /opt/cni/bin
-        state: directory
-        mode: '0755'
-
-    - name: Check if CNI plugins are installed
-      stat:
-        path: /opt/cni/bin/flannel
-      register: flannel_plugin
+        var: node_status.stdout_lines
     
-    - name: Install CNI plugins if missing
-      shell: |
-        if [ ! -f /opt/cni/bin/flannel ]; then
-          mkdir -p /opt/cni/bin
-          curl -L https://github.com/containernetworking/plugins/releases/download/v1.2.0/cni-plugins-linux-{{ 'arm64' if ansible_architecture == 'aarch64' else ansible_architecture }}-v1.2.0.tgz | tar -C /opt/cni/bin -xz
-        fi
-      when: not flannel_plugin.stat.exists
-      ignore_errors: true
+    # If we get this far, remove master node taints to allow scheduling (optional)
+    - name: Remove NoSchedule taint from control plane
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf taint nodes --all node-role.kubernetes.io/control-plane- || echo "No taints to remove"
+      when: true  # Change to a condition if you want to keep taints in some cases
+    
+    # Final verification of network connectivity
+    - name: Verify kube-dns/CoreDNS is Running
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system -l k8s-app=kube-dns
+      register: dns_status
+      
+    - name: Display DNS status
+      debug:
+        var: dns_status.stdout_lines
+    
+    - name: Create test pod to verify networking
+      block:
+        - name: Create a test pod to verify networking
+          copy:
+            dest: /tmp/test-pod.yaml
+            content: |
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: network-test
+                namespace: default
+              spec:
+                containers:
+                - name: network-test
+                  image: busybox:1.28
+                  command:
+                    - sleep
+                    - "3600"
+                restartPolicy: Always
+            mode: '0644'
+        
+        - name: Apply test pod
+          shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f /tmp/test-pod.yaml
+          register: test_pod_apply
+          ignore_errors: true
+          
+        - name: Wait for test pod to be Running
+          shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get pod network-test -o jsonpath='{.status.phase}'
+          register: test_pod_status
+          retries: 15
+          delay: 10
+          until: test_pod_status.stdout == "Running"
+          ignore_errors: true
+        
+        - name: Test internal DNS resolution (kube-dns/CoreDNS)
+          shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf exec network-test -- nslookup kubernetes.default.svc.cluster.local
+          register: dns_test
+          ignore_errors: true
+          when: test_pod_status.stdout == "Running"
+        
+        - name: Display DNS test results
+          debug:
+            var: dns_test.stdout_lines
+          when: dns_test is defined and dns_test.stdout_lines is defined
+        
+        - name: Test pod network connectivity
+          shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf exec network-test -- ping -c 4 8.8.8.8
+          register: network_test
+          ignore_errors: true
+          when: test_pod_status.stdout == "Running"
+          
+        - name: Display network test results
+          debug:
+            var: network_test.stdout_lines
+          when: network_test is defined and network_test.stdout_lines is defined
+          
+        - name: Clean up test pod
+          shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf delete pod network-test
+          ignore_errors: true
+      
+    - name: Final CNI status
+      debug:
+        msg: "CNI plugin deployment completed. Network connectivity status: {{ (network_test is defined and network_test.rc == 0) | ternary('Success', 'Incomplete') }}"
+    
+    # Add comprehensive recovery steps if API server is not healthy
+    - name: Attempt to fix API server if not healthy
+      block:
+        - name: Check kubelet status
+          service:
+            name: kubelet
+            state: started
+          register: kubelet_status
+          
+        - name: Check API server pod manifest
+          stat:
+            path: /etc/kubernetes/manifests/kube-apiserver.yaml
+          register: apiserver_manifest
+          
+        - name: Check HAProxy status
+          service:
+            name: haproxy
+            state: started
+          register: haproxy_status
+          
+        - name: Check keepalived status
+          service:
+            name: keepalived
+            state: started
+          register: keepalived_status
+          
+        - name: Display component status
+          debug:
+            msg: >
+              Component status:
+              - Kubelet: {{ kubelet_status.status.ActiveState | default('unknown') }}
+              - API server manifest: {{ apiserver_manifest.stat.exists | default(false) | ternary('exists', 'missing') }}
+              - HAProxy: {{ haproxy_status.status.ActiveState | default('unknown') }}
+              - Keepalived: {{ keepalived_status.status.ActiveState | default('unknown') }}
+        
+        # Verify etcd connectivity from API server
+        - name: Verify etcd connectivity
+          shell: >
+            ETCDCTL_API=3 etcdctl 
+            --cacert=/etc/kubernetes/pki/etcd/ca.crt 
+            --cert=/etc/kubernetes/pki/apiserver-etcd-client.crt 
+            --key=/etc/kubernetes/pki/apiserver-etcd-client.key
+            --endpoints=https://127.0.0.1:2379 
+            endpoint health || echo "etcd health check failed"
+          register: etcd_api_conn
+          ignore_errors: true
+
+        - name: Display etcd connectivity
+          debug:
+            msg: "etcd connectivity from API server: {{ etcd_api_conn.stdout | default('unknown') }}"
+              
+        # Enhanced recovery procedure
+        - name: Perform comprehensive recovery procedure
+          block:
+            # 1. Fix configuration files first
+            - name: Apply configuration sync to ensure consistent port settings
+              include_role:
+                name: ../roles/kube_apiserver
+                tasks_from: sync_apiserver_config
+              when: apiserver_manifest.stat.exists
+
+            # 2. Verify certificates
+            - name: Check API server certificate permissions
+              file:
+                path: "/etc/kubernetes/pki/{{ item }}"
+                mode: "0600"
+                state: file
+              loop:
+                - apiserver.key
+                - apiserver-etcd-client.key
+                - apiserver-kubelet-client.key
+              ignore_errors: true
+              when: apiserver_manifest.stat.exists
+
+            # 3. Fix HAProxy and Keepalived
+            - name: Ensure HAProxy configuration is correct
+              template:
+                src: ../roles/kube_apiserver/templates/haproxy.cfg.j2
+                dest: /etc/haproxy/haproxy.cfg
+                mode: '0644'
+              register: haproxy_cfg_updated
+              
+            - name: Restart HAProxy with correct config
+              service:
+                name: haproxy
+                state: restarted
+              when: haproxy_cfg_updated.changed or haproxy_status.status.ActiveState != 'active'
+
+            - name: Ensure keepalived configuration is correct
+              template:
+                src: ../roles/kube_apiserver/templates/keepalived.conf.j2
+                dest: /etc/keepalived/keepalived.conf
+                mode: '0644'
+              register: keepalived_cfg_updated
+              
+            - name: Restart keepalived with correct config
+              service:
+                name: keepalived
+                state: restarted
+              when: keepalived_cfg_updated.changed or keepalived_status.status.ActiveState != 'active'
+
+            # 4. Fix systemd unit files if needed
+            - name: Set correct kubelet environment
+              copy:
+                dest: /etc/default/kubelet
+                content: |
+                  KUBELET_EXTRA_ARGS=--container-runtime-endpoint=unix:///run/containerd/containerd.sock
+                mode: '0644'
+              register: kubelet_env_updated
+
+            # 5. Regenerate API server manifest if missing
+            - name: Regenerate API server manifest if missing
+              command: kubeadm init phase control-plane apiserver --config=/etc/kubernetes/kubeadm/kubeadm-init.yaml
+              when: not apiserver_manifest.stat.exists
+              ignore_errors: true
+              
+            # 6. Restart kubelet as the final step
+            - name: Restart kubelet to pick up all changes
+              service:
+                name: kubelet
+                state: restarted
+                daemon_reload: yes
+              when: kubelet_env_updated.changed or not apiserver_manifest.stat.exists
+                
+            # 7. Wait longer for services to stabilize
+            - name: Wait for services to stabilize after comprehensive recovery
+              pause:
+                seconds: 60
+
+            # 8. Check API server health with longer retry period
+            - name: Check API server health after comprehensive recovery
+              shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw='/healthz' || echo "not ready"
+              register: api_health_comprehensive
+              retries: 15
+              delay: 10
+              until: api_health_comprehensive.stdout == "ok"
+              ignore_errors: true
+              
+            - name: Display API server health after comprehensive recovery
+              debug:
+                msg: "API server health after comprehensive recovery: {{ api_health_comprehensive.stdout | default('still not available') }}"
+              
+            # 9. Additional diagnostics if still not working
+            - name: Gather extended diagnostics if API server still not healthy
+              block:
+                - name: Check kubelet logs
+                  shell: journalctl -u kubelet --no-pager -n 100 | grep -i error
+                  register: kubelet_err_logs
+                  ignore_errors: true
+                  
+                - name: Display kubelet error logs
+                  debug:
+                    var: kubelet_err_logs.stdout_lines
+                    
+                - name: Check container runtime status
+                  shell: crictl --runtime-endpoint unix:///run/containerd/containerd.sock ps -a | grep kube-apiserver
+                  register: apiserver_container
+                  ignore_errors: true
+                  
+                - name: Display API server container status
+                  debug:
+                    var: apiserver_container.stdout_lines
+              when: api_health_comprehensive.stdout != "ok"
+      when: not combined_health | default(false)

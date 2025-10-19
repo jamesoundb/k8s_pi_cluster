@@ -1,6 +1,10 @@
 ---
 # Common role - OS preparation tasks for Kubernetes
 
+# Check node health and connectivity first
+- name: Check node health and connectivity
+  include_tasks: node_health_check.yml
+
 - name: Set hostname
   hostname:
     name: "{{ inventory_hostname }}"

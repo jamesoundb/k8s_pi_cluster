@@ -1,6 +1,16 @@
 ---
 # Containerd role - Container runtime installation and configuration
 
+# First, check and fix containerd if needed
+- name: Verify containerd installation
+  include_tasks: verify_containerd.yml
+  
+# Only proceed with remaining tasks if verification indicated a need for reinstall
+- name: Check if containerd reinstall is needed
+  stat:
+    path: /run/containerd/containerd.sock
+  register: containerd_socket_check
+
 # Clean up any previous problematic containerd installation
 - name: Check if services exist
   stat:
@@ -15,7 +25,7 @@
     name: "{{ item.item }}"
     state: stopped
   loop: "{{ service_status.results }}"
-  when: item.stat.exists
+  when: item.stat is defined and item.stat.exists
   ignore_errors: true
 
 - name: Remove previous containerd installation
@@ -186,6 +196,25 @@
     daemon_reload: true
     enabled: true
 
+- name: Check containerd service status
+  shell: systemctl status containerd
+  register: containerd_status_check
+  changed_when: false
+  ignore_errors: true
+
+- name: Display containerd service status
+  debug:
+    var: containerd_status_check.stdout_lines
+    verbosity: 1
+
+- name: Ensure containerd service is running
+  systemd:
+    name: containerd
+    state: started
+    enabled: true
+  register: ensure_containerd
+  ignore_errors: true
+
 - name: Wait for containerd socket to be created
   wait_for:
     path: /run/containerd/containerd.sock
@@ -199,15 +228,22 @@
     mode: '0660'
   ignore_errors: true
 
-- name: Start kubelet service
+- name: Check if kubelet service file exists
+  stat:
+    path: "/etc/systemd/system/kubelet.service"
+  register: kubelet_service_exists
+
+- name: Start kubelet service if it exists
   systemd:
     name: kubelet
     state: restarted
     enabled: true
+  when: kubelet_service_exists.stat.exists
 
-- name: Wait for kubelet to restart
+- name: Wait for kubelet to restart if it exists
   pause:
     seconds: 10
+  when: kubelet_service_exists.stat.exists
     
 - name: Check containerd status
   command: systemctl status containerd

@@ -2,7 +2,7 @@
 # Global variables for Kubernetes cluster
 
 # Kubernetes version
-k8s_version: "1.29.0"
+k8s_version: "1.34.1"
 
 # Network configurations
 pod_network_cidr: "10.244.0.0/16"
@@ -11,6 +11,10 @@ service_network_cidr: "10.245.0.0/16"
 # Control plane endpoint (Virtual IP for HA)
 control_plane_endpoint: "192.168.1.100"
 control_plane_endpoint_port: "6443"
+apiserver_bind_port: "6444"  # API server binds to this port, HAProxy forwards from control_plane_endpoint_port
+
+# HA configuration
+keepalived_auth_pass: "K8sVIP"  # Consistent password for keepalived authentication
 
 # Cluster configuration
 cluster_name: "pi-k8s-cluster"

@@ -80,7 +80,7 @@
         kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system -l app=flannel -o jsonpath='{.items[*].status.containerStatuses[0].ready}' | grep -v false
       register: flannel_ready
       until: flannel_ready.rc == 0
-      retries: 30
+      retries: 5
       delay: 10
       changed_when: false
       ignore_errors: true

@@ -1,33 +1,96 @@
 #cloud-config
+
+# Minimal Ubuntu 24.04 LTS Cloud-Init Configuration for Kubernetes Node: k8s-node-3
+# Generated for user: k8s_82 
+# Simplified for fast boot and reliable provisioning
+
+# System Information
 hostname: k8s-node-3
-timezone: America/Los_Angeles
+prefer_fqdn_over_hostname: false
+manage_etc_hosts: true
+
+# User Configuration
 users:
   - name: k8s_82
+    groups: [adm, sudo, netdev]
+    shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
     ssh_authorized_keys:
-      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDC5PcI8sHqG8w7K9UM68bOIC26Ie/J/xHm5Wr+3lpAGI8K3qzd0rzEUlJ2F34BuULKN+yW+R1ElXvAO/9yJTZjFH8YwVNSh5cYi07/NJ7j4wVQyzdif6z0s4WkLvpHni00OlISc/ul8CIFAhAVeXrXJVYhp85tZEsE7lQpmV2zr4dAaqLUWJap7QM63Mrypr+PasJS1uaB8+4yqOsmVm/xLsgrTZ/+HqPb1BQzAtL054Jp1K1YUsjukFQV7AgSav/3CHEeYxDiKxI0d1lllQDPKWEvLExToqZCDUarATjBw8OX+3NPRoal9O5Weux9Cx/ISIf3OXexMdy2fLhpCjOM6ppyanCecA4kSS+vgIGMXv8euAE+PTlmxPS4vLT2WPjxVR0O/6myDuZrFu3dwmFiyAeGtbN2E4tdiQ5vQXKAg1FYgt1fRMXYtkiFa3/jhROd36Hpem8A9L3t/3y2ZUwqZLPzjgYnVvcgHQNKkqou3cq/m13qtdOj7Fh6TSrbElBjrNvR8iFDquLjaQX5pyQvw93llk0C8CpUGK9TkAgHV42CxkERDQ1D/sDoFgV3zmSTY049JrZAohDBWSqbujNRdWc5R9h9cM9Kvk7xchUdA6FKpr7GnyrIGexEgVHvkveBC71o9xzT6XhEANkDIOWTJyWcrd7Ebiu4fo90tphB4w== k8s_pi key
-    groups: [sudo, docker, sys]
-    shell: /bin/bash
-chpasswd:
-  expire: false
-ssh_pwauth: false
-disable_root: true
+      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC9eiOsfazo+EtrfPrSLbiRUxCMq1ihs11AUGczdT1DNJZp52qhXEzOmGMW6KMy3xvOmfMDu1C/vwttieQ/xVKEmXCIjVJ7A1cvNDWYWwH5R+Q8SUFVy7M7WPoMXZ4STK9OQOCDd696+k/eOZg0H0vZoECpy/ku4eNVbEdBXWltGhC245IU0+eGbrtLnMD4Exv/eCXZEPMEwBsyNTg+DFbc1WYHu9cYQarC9SCStWouUoGdxI2SEZ6tabijnmsqVDZmWGIutYCGgyizl+wE4p/VJHKNpcQsoguLTgXyIaJe5Ab7bYpIrSPritGBTKBW1v5Dsm2sgV8Uqg5afDovUOH2tWN2uQYmuE+TBIYt5CZrEdPItewNyapFSVQxERH71mDwe5dojS4Ps0pcFG6V8y5xp6PP7uVtxMZiGo+zPduG8RFKUqjw52rAFZG6jfuziK6Ry9UislzIDLFy+O2VA9MUV7XI6u06CoVsyZunSzwH+stH/vG7B/Y+dPkBBvnOYMvjXAGsbVYDLVv+uLkvs6tRCS707jVKFK49CM4EU9M9Xpq7lWTbPJHGAnuoUzc5OdgICAq3NB4qXBE2JX+0ag5FqvSfyIsUbotPTUjvDFPDo3SOpkw4nY3AyrHEbbocSURc5e6W/cd6BfH8QsrU682Nvt6cMxJZU+lEQdR6MhZwkQ== k8s_pi_cluster
+    lock_passwd: true
 
+# Package Management - Essential only
+package_update: true
+package_upgrade: false  # Skip upgrade for speed
+packages:
+  # Absolute essentials only
+  - curl
+  - wget
+  - vim
+  - net-tools
+  - software-properties-common
+  - apt-transport-https
+  - ca-certificates
+  - gnupg
+
+# System Configuration
+timezone: UTC
+locale: en_US.UTF-8
+
+# Essential Kubernetes preparation only
 write_files:
-  - path: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
-    content: |
-      network: {config: disabled}
   - path: /etc/modules-load.d/k8s.conf
     content: |
       overlay
       br_netfilter
-  - path: /etc/sysctl.d/k8s.conf
+    permissions: '0644'
+    owner: root:root
+
+  - path: /etc/sysctl.d/k8s.conf  
     content: |
       net.bridge.bridge-nf-call-iptables = 1
       net.bridge.bridge-nf-call-ip6tables = 1
       net.ipv4.ip_forward = 1
+    permissions: '0644'
+    owner: root:root
 
+# SSH Configuration
+ssh:
+  emit_keys_to_console: false
+  ssh_deletekeys: true
+  ssh_genkeytypes: ['rsa', 'ecdsa', 'ed25519']
+
+ssh_pwauth: false
+disable_root: true
+
+# Minimal setup - let Ansible handle the rest
 runcmd:
-  # Only set up basic system configs via cloud-init
-  - echo "Node initialized with cloud-init on $(date)" > /home/k8s_82/README.txt
-  - chown k8s_82:k8s_82 /home/k8s_82/README.txt
+  # Load essential kernel modules
+  - modprobe overlay
+  - modprobe br_netfilter
+  
+  # Disable swap (critical for Kubernetes)
+  - swapoff -a
+  - sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+  
+  # Apply basic sysctl settings
+  - sysctl --system
+
+# No reboot - keep it simple
+power_state:
+  mode: reboot
+  timeout: 30
+  condition: true
+
+# Final message
+final_message: |
+  🎉 Minimal cloud-init setup completed!
+  
+  Node: k8s-node-3 
+  User: k8s_82
+  
+  ✅ Basic system configured
+  ✅ SSH access ready
+  ✅ Minimal Kubernetes prep done
+  
+  Ready for Ansible deployment!

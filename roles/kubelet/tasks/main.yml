@@ -27,6 +27,76 @@
   when: "'arm' not in ansible_architecture"
   notify: Restart kubelet
 
+# Create bootstrap kubelet config to ensure kubelet connects to the API server
+- name: Create bootstrap kubelet config
+  copy:
+    dest: /etc/kubernetes/bootstrap-kubelet.conf
+    content: |
+      apiVersion: v1
+      kind: Config
+      clusters:
+      - cluster:
+          certificate-authority: /etc/kubernetes/pki/ca.crt
+          server: https://{{ control_plane_endpoint }}:{{ control_plane_endpoint_port }}
+        name: kubernetes
+      contexts:
+      - context:
+          cluster: kubernetes
+          user: kubelet-bootstrap
+        name: bootstrap
+      current-context: bootstrap
+      users:
+      - name: kubelet-bootstrap
+        user:
+          token: {{ lookup('env', 'BOOTSTRAP_TOKEN') | default('abcdef.0123456789abcdef') }}
+    mode: '0600'
+  when: inventory_hostname in groups['k8s_master']
+  
+- name: Configure kubelet to use bootstrap config
+  copy:
+    dest: /etc/systemd/system/kubelet.service.d/20-bootstrap.conf
+    content: |
+      [Service]
+      Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+    mode: '0644'
+  when: inventory_hostname in groups['k8s_master']
+  notify: Restart kubelet
+
+# Create bootstrap kubelet config to ensure kubelet connects to the API server
+- name: Create bootstrap kubelet config
+  copy:
+    dest: /etc/kubernetes/bootstrap-kubelet.conf
+    content: |
+      apiVersion: v1
+      kind: Config
+      clusters:
+      - cluster:
+          certificate-authority: /etc/kubernetes/pki/ca.crt
+          server: https://{{ control_plane_endpoint }}:{{ control_plane_endpoint_port }}
+        name: kubernetes
+      contexts:
+      - context:
+          cluster: kubernetes
+          user: kubelet-bootstrap
+        name: bootstrap
+      current-context: bootstrap
+      users:
+      - name: kubelet-bootstrap
+        user:
+          token: {{ lookup('env', 'BOOTSTRAP_TOKEN') | default('abcdef.0123456789abcdef') }}
+    mode: '0600'
+  when: inventory_hostname in groups['k8s_master']
+  
+- name: Configure kubelet to use bootstrap config
+  copy:
+    dest: /etc/systemd/system/kubelet.service.d/20-bootstrap.conf
+    content: |
+      [Service]
+      Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+    mode: '0644'
+  when: inventory_hostname in groups['k8s_master']
+  notify: Restart kubelet
+
 # Enable kubelet but don't start it (kubeadm will handle this)
 - name: Enable kubelet service
   systemd:

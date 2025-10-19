@@ -1,10 +1,28 @@
+# Ubuntu 24.04 LTS Network Configuration Template
+# Static IP configuration for Kubernetes node
+# Optimized for Raspberry Pi 4 Ethernet interface
+
 version: 2
 ethernets:
   eth0:
     dhcp4: false
-    addresses: [192.168.1.80/24]
+    dhcp6: false 
+    addresses:
+      - 192.168.1.80/24
     routes:
       - to: default
         via: 192.168.1.1
+        metric: 100
     nameservers:
-      addresses: [8.8.8.8, 8.8.4.4]
+      addresses:
+        - 192.168.1.1    # Primary DNS (local router)
+        - 1.1.1.1        # Cloudflare DNS (backup)
+        - 8.8.8.8        # Google DNS (fallback)
+      search:
+        - localdomain
+    optional: false
+    # Network performance optimizations
+    dhcp4-overrides:
+      use-hostname: false
+      use-routes: false
+      use-dns: false

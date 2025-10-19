@@ -1,22 +1,28 @@
 ---
 # etcd role - High availability key-value store for Kubernetes
-# This is initialized using kubeadm on the first control plane node
 
 - name: Create etcd data directory
   file:
     path: /var/lib/etcd
     state: directory
     mode: '0700'
+    owner: root
+    group: root
 
-# On the first control plane node (init node)
+# Create Kubernetes configuration directories
 - name: Create Kubernetes configuration directory
   file:
     path: /etc/kubernetes/
     state: directory
     mode: '0755'
-  when: inventory_hostname in groups['k8s_master_init']
 
-# Generate certificates independently
+- name: Create Kubernetes manifests directory
+  file:
+    path: /etc/kubernetes/manifests
+    state: directory
+    mode: '0755'
+
+# Generate certificates on first node, distribute to others
 - name: Generate etcd CA and certificates
   block:
     - name: Create PKI directories
@@ -37,6 +43,13 @@
       shell: openssl req -x509 -new -nodes -key /etc/kubernetes/pki/etcd/ca.key -subj "/CN=etcd-ca" -days 10000 -out /etc/kubernetes/pki/etcd/ca.crt
       args:
         creates: /etc/kubernetes/pki/etcd/ca.crt
+      register: ca_cert_result
+      
+    - name: Verify CA certificate
+      shell: openssl x509 -in /etc/kubernetes/pki/etcd/ca.crt -text -noout | grep "Subject:"
+      register: ca_verify
+      failed_when: "'CN = etcd-ca' not in ca_verify.stdout"
+      when: ca_cert_result is changed
 
     - name: Generate etcd server private key
       shell: openssl genrsa -out /etc/kubernetes/pki/etcd/server.key 2048
@@ -44,22 +57,9 @@
         creates: /etc/kubernetes/pki/etcd/server.key
 
     - name: Create etcd server certificate config
-      copy:
+      template:
+        src: server-csr.conf.j2
         dest: /etc/kubernetes/pki/etcd/server-csr.conf
-        content: |
-          [req]
-          req_extensions = v3_req
-          distinguished_name = req_distinguished_name
-          [req_distinguished_name]
-          [ v3_req ]
-          basicConstraints = CA:FALSE
-          keyUsage = nonRepudiation, digitalSignature, keyEncipherment
-          subjectAltName = @alt_names
-          [alt_names]
-          DNS.1 = localhost
-          DNS.2 = {{ inventory_hostname }}
-          IP.1 = 127.0.0.1
-          IP.2 = {{ ansible_host }}
         mode: '0644'
 
     - name: Generate etcd server CSR
@@ -71,7 +71,142 @@
       shell: openssl x509 -req -in /etc/kubernetes/pki/etcd/server.csr -CA /etc/kubernetes/pki/etcd/ca.crt -CAkey /etc/kubernetes/pki/etcd/ca.key -CAcreateserial -out /etc/kubernetes/pki/etcd/server.crt -days 10000 -extensions v3_req -extfile /etc/kubernetes/pki/etcd/server-csr.conf
       args:
         creates: /etc/kubernetes/pki/etcd/server.crt
+      register: server_cert_result
+      
+    - name: Verify server certificate SANs
+      shell: |
+        if [ -f "/etc/kubernetes/pki/etcd/server.crt" ]; then
+          openssl x509 -in /etc/kubernetes/pki/etcd/server.crt -text -noout | grep -A1 "Subject Alternative Name" | grep "IP Address:{{ ansible_host }}"
+          exit $?
+        else
+          echo "Certificate file does not exist"
+          exit 1
+        fi
+      register: server_verify
+      failed_when: ansible_host not in server_verify.stdout and server_verify.rc != 0
+      when: server_cert_result is changed
+        
+    - name: Generate etcd peer private key
+      shell: openssl genrsa -out /etc/kubernetes/pki/etcd/peer.key 2048
+      args:
+        creates: /etc/kubernetes/pki/etcd/peer.key
+
+    - name: Create etcd peer certificate config
+      template:
+        src: peer-csr.conf.j2
+        dest: /etc/kubernetes/pki/etcd/peer-csr.conf
+        mode: '0644'
+        
+    - name: Generate etcd peer CSR
+      shell: openssl req -new -key /etc/kubernetes/pki/etcd/peer.key -subj "/CN={{ inventory_hostname }}" -config /etc/kubernetes/pki/etcd/peer-csr.conf -out /etc/kubernetes/pki/etcd/peer.csr
+      args:
+        creates: /etc/kubernetes/pki/etcd/peer.csr
+        
+    - name: Sign etcd peer certificate
+      shell: openssl x509 -req -in /etc/kubernetes/pki/etcd/peer.csr -CA /etc/kubernetes/pki/etcd/ca.crt -CAkey /etc/kubernetes/pki/etcd/ca.key -CAcreateserial -out /etc/kubernetes/pki/etcd/peer.crt -days 10000 -extensions v3_req -extfile /etc/kubernetes/pki/etcd/peer-csr.conf
+      args:
+        creates: /etc/kubernetes/pki/etcd/peer.crt
+      register: peer_cert_result
+      
+    - name: Verify peer certificate SANs
+      shell: |
+        if [ -f "/etc/kubernetes/pki/etcd/peer.crt" ]; then
+          openssl x509 -in /etc/kubernetes/pki/etcd/peer.crt -text -noout | grep -A1 "Subject Alternative Name" | grep "IP Address:{{ ansible_host }}"
+          exit $?
+        else
+          echo "Peer certificate file does not exist"
+          exit 1
+        fi
+      register: peer_verify
+      failed_when: ansible_host not in peer_verify.stdout and peer_verify.rc != 0
+      when: peer_cert_result is changed
+
+    - name: Generate API server etcd client private key
+      shell: openssl genrsa -out /etc/kubernetes/pki/apiserver-etcd-client.key 2048
+      args:
+        creates: /etc/kubernetes/pki/apiserver-etcd-client.key
+      when: inventory_hostname in groups['k8s_master_init']
+
+    - name: Create API server etcd client certificate config
+      template:
+        src: apiserver-etcd-client-csr.conf.j2
+        dest: /etc/kubernetes/pki/etcd/apiserver-etcd-client-csr.conf
+        mode: '0644'
+      when: inventory_hostname in groups['k8s_master_init']
+
+    - name: Generate API server etcd client CSR
+      shell: openssl req -new -key /etc/kubernetes/pki/apiserver-etcd-client.key -subj "/CN=kube-apiserver" -config /etc/kubernetes/pki/etcd/apiserver-etcd-client-csr.conf -out /etc/kubernetes/pki/etcd/apiserver-etcd-client.csr
+      args:
+        creates: /etc/kubernetes/pki/etcd/apiserver-etcd-client.csr
+      when: inventory_hostname in groups['k8s_master_init']
+
+    - name: Sign API server etcd client certificate
+      shell: openssl x509 -req -in /etc/kubernetes/pki/etcd/apiserver-etcd-client.csr -CA /etc/kubernetes/pki/etcd/ca.crt -CAkey /etc/kubernetes/pki/etcd/ca.key -CAcreateserial -out /etc/kubernetes/pki/apiserver-etcd-client.crt -days 10000 -extensions v3_req -extfile /etc/kubernetes/pki/etcd/apiserver-etcd-client-csr.conf
+      args:
+        creates: /etc/kubernetes/pki/apiserver-etcd-client.crt
+      register: api_client_cert_result
+      when: inventory_hostname in groups['k8s_master_init']
+      
+    - name: Verify API server etcd client certificate
+      shell: |
+        if [ -f "/etc/kubernetes/pki/apiserver-etcd-client.crt" ]; then
+          echo "Checking subject name..."
+          openssl x509 -in /etc/kubernetes/pki/apiserver-etcd-client.crt -text -noout | grep "Subject:" | grep "CN = kube-apiserver"
+          SUBJ_CHECK=$?
+          
+          echo "Verifying certificate against CA..."
+          openssl verify -CAfile /etc/kubernetes/pki/etcd/ca.crt /etc/kubernetes/pki/apiserver-etcd-client.crt
+          CA_CHECK=$?
+          
+          if [ $SUBJ_CHECK -eq 0 ] && [ $CA_CHECK -eq 0 ]; then
+            echo "API server client certificate is valid"
+            exit 0
+          else
+            echo "API server client certificate verification failed"
+            exit 1
+          fi
+        else
+          echo "API server client certificate file does not exist"
+          exit 1
+        fi
+      register: api_client_verify
+      failed_when: api_client_verify.rc != 0
+      when: inventory_hostname in groups['k8s_master_init'] and api_client_cert_result is changed
   when: inventory_hostname in groups['k8s_master_init']
+
+# Ensure all certificate files have correct permissions
+- name: Ensure proper certificate file permissions
+  file:
+    path: "{{ item }}"
+    state: file
+    mode: "{{ '0600' if ('key' in item) else '0644' }}"
+    owner: root
+    group: root
+  with_items:
+    - /etc/kubernetes/pki/etcd/ca.crt
+    - /etc/kubernetes/pki/etcd/ca.key
+    - /etc/kubernetes/pki/etcd/server.crt
+    - /etc/kubernetes/pki/etcd/server.key
+    - /etc/kubernetes/pki/etcd/peer.crt
+    - /etc/kubernetes/pki/etcd/peer.key
+  when: inventory_hostname in groups['k8s_master']
+  failed_when: false
+  ignore_errors: true
+  
+- name: Ensure proper API server etcd client certificate permissions
+  shell: |
+    for file in "/etc/kubernetes/pki/apiserver-etcd-client.crt" "/etc/kubernetes/pki/apiserver-etcd-client.key"; do
+      if [ -f "$file" ]; then
+        chmod 0600 "$file"
+        chown root:root "$file"
+        echo "Fixed permissions on $file"
+      else
+        echo "File $file does not exist, skipping"
+      fi
+    done
+  register: api_cert_perms
+  changed_when: "'Fixed permissions' in api_cert_perms.stdout"
+  when: inventory_hostname in groups['k8s_master']
 
 # Distribute certificates to other control plane nodes
 - name: Ensure PKI directory exists on other nodes
@@ -83,40 +218,150 @@
     group: root
   when: inventory_hostname in groups['k8s_master'] and inventory_hostname not in groups['k8s_master_init']
 
+- name: Create local temporary directory for certificates
+  delegate_to: localhost
+  file:
+    path: "/tmp/etcd-certs"
+    state: directory
+    mode: '0755'
+  run_once: true
+  become: false
+
 - name: Fetch certificates from primary node
   fetch:
-    src: "/etc/kubernetes/pki/etcd/{{ item }}"
-    dest: "/tmp/etcd-certs/"
+    src: "{{ item.src }}"
+    dest: "/tmp/etcd-certs/{{ item.dest }}"
     flat: yes
   with_items:
-    - ca.crt
-    - ca.key
-    - server.crt
-    - server.key
+    - { src: "/etc/kubernetes/pki/etcd/ca.crt", dest: "ca.crt" }
+    - { src: "/etc/kubernetes/pki/etcd/ca.key", dest: "ca.key" }
   when: inventory_hostname == groups['k8s_master_init'][0]
 
-- name: Copy certificates to secondary nodes
+- name: Ensure PKI directory structure exists on secondary nodes
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  with_items:
+    - /etc/kubernetes/pki
+    - /etc/kubernetes/pki/etcd
+  when: inventory_hostname in groups['k8s_master'] and inventory_hostname not in groups['k8s_master_init']
+
+- name: Copy shared certificates to secondary nodes (CA and apiserver client)
   copy:
-    src: "/tmp/etcd-certs/{{ item }}"
-    dest: "/etc/kubernetes/pki/etcd/{{ item }}"
+    src: "/tmp/etcd-certs/{{ item.src }}"
+    dest: "{{ item.dest }}"
     mode: '0600'
     owner: root
     group: root
   with_items:
-    - ca.crt
-    - ca.key
-    - server.crt
-    - server.key
+    - { src: "ca.crt", dest: "/etc/kubernetes/pki/etcd/ca.crt" }
+    - { src: "ca.key", dest: "/etc/kubernetes/pki/etcd/ca.key" }
   when: inventory_hostname in groups['k8s_master'] and inventory_hostname not in groups['k8s_master_init']
 
-# Replace the cleanup task with a remote cleanup
-- name: Cleanup temporary certificate directory on remote nodes
+- name: Generate node-specific certificates on secondary nodes
+  block:
+    # Server certificate for each node
+    - name: Create etcd server certificate config
+      template:
+        src: server-csr.conf.j2
+        dest: /etc/kubernetes/pki/etcd/server-csr.conf
+        mode: '0644'
+
+    - name: Generate etcd server private key
+      shell: openssl genrsa -out /etc/kubernetes/pki/etcd/server.key 2048
+      args:
+        creates: /etc/kubernetes/pki/etcd/server.key
+
+    - name: Generate etcd server CSR
+      shell: openssl req -new -key /etc/kubernetes/pki/etcd/server.key -subj "/CN={{ inventory_hostname }}" -config /etc/kubernetes/pki/etcd/server-csr.conf -out /etc/kubernetes/pki/etcd/server.csr
+      args:
+        creates: /etc/kubernetes/pki/etcd/server.csr
+
+    - name: Sign etcd server certificate
+      shell: openssl x509 -req -in /etc/kubernetes/pki/etcd/server.csr -CA /etc/kubernetes/pki/etcd/ca.crt -CAkey /etc/kubernetes/pki/etcd/ca.key -CAcreateserial -out /etc/kubernetes/pki/etcd/server.crt -days 10000 -extensions v3_req -extfile /etc/kubernetes/pki/etcd/server-csr.conf
+      args:
+        creates: /etc/kubernetes/pki/etcd/server.crt
+        
+    # Peer certificate for each node
+    - name: Create etcd peer certificate config
+      template:
+        src: peer-csr.conf.j2
+        dest: /etc/kubernetes/pki/etcd/peer-csr.conf
+        mode: '0644'
+    
+    - name: Generate etcd peer private key
+      shell: openssl genrsa -out /etc/kubernetes/pki/etcd/peer.key 2048
+      args:
+        creates: /etc/kubernetes/pki/etcd/peer.key
+        
+    - name: Generate etcd peer CSR
+      shell: openssl req -new -key /etc/kubernetes/pki/etcd/peer.key -subj "/CN={{ inventory_hostname }}" -config /etc/kubernetes/pki/etcd/peer-csr.conf -out /etc/kubernetes/pki/etcd/peer.csr
+      args:
+        creates: /etc/kubernetes/pki/etcd/peer.csr
+        
+    - name: Sign etcd peer certificate
+      shell: openssl x509 -req -in /etc/kubernetes/pki/etcd/peer.csr -CA /etc/kubernetes/pki/etcd/ca.crt -CAkey /etc/kubernetes/pki/etcd/ca.key -CAcreateserial -out /etc/kubernetes/pki/etcd/peer.crt -days 10000 -extensions v3_req -extfile /etc/kubernetes/pki/etcd/peer-csr.conf
+      args:
+        creates: /etc/kubernetes/pki/etcd/peer.crt
+  when: inventory_hostname in groups['k8s_master'] and inventory_hostname not in groups['k8s_master_init']
+
+# Fetch apiserver client certificates from primary node and copy to secondary nodes
+- name: Fetch apiserver etcd client certificate from primary node
+  fetch:
+    src: "{{ item.src }}"
+    dest: "/tmp/etcd-certs/{{ item.dest }}"
+    flat: yes
+  with_items:
+    - { src: "/etc/kubernetes/pki/apiserver-etcd-client.crt", dest: "apiserver-etcd-client.crt" }
+    - { src: "/etc/kubernetes/pki/apiserver-etcd-client.key", dest: "apiserver-etcd-client.key" }
+  when: inventory_hostname == groups['k8s_master_init'][0]
+  ignore_errors: true
+
+- name: Copy apiserver etcd client certificates to secondary nodes
+  copy:
+    src: "/tmp/etcd-certs/{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: '0600'
+    owner: root
+    group: root
+  with_items:
+    - { src: "apiserver-etcd-client.crt", dest: "/etc/kubernetes/pki/apiserver-etcd-client.crt" }
+    - { src: "apiserver-etcd-client.key", dest: "/etc/kubernetes/pki/apiserver-etcd-client.key" }
+  when: inventory_hostname in groups['k8s_master'] and inventory_hostname not in groups['k8s_master_init']
+  ignore_errors: true
+
+# Clean up temporary files
+- name: Cleanup temporary certificate files on nodes
   file:
-    path: "/tmp/etcd-certs-{{ inventory_hostname }}"
+    path: "/tmp/{{ item }}"
     state: absent
+  with_items:
+    - "etcd-certs-{{ inventory_hostname }}"
+    - "server-csr.conf"
+    - "server.csr"
+    - "peer-csr.conf"
+    - "peer.csr"
+    - "apiserver-etcd-client-csr.conf"
+    - "apiserver-etcd-client.csr"
   when: inventory_hostname in groups['k8s_master']
 
+- name: Cleanup local temporary certificate directory
+  delegate_to: localhost
+  become: false
+  file:
+    path: "/tmp/etcd-certs"
+    state: absent
+  run_once: true
+  when: inventory_hostname == groups['k8s_master'][0]
+
 # For all etcd nodes (all control-plane nodes)
+- name: Create etcd systemd directory
+  file:
+    path: /etc/systemd/system/etcd.service.d
+    state: directory
+    mode: '0755'
+
 - name: Apply etcd performance optimizations
   copy:
     dest: /etc/systemd/system/etcd.service.d/10-performance.conf
@@ -135,4 +380,60 @@
     minute: "0"
     hour: "*/6"
     job: "mkdir -p /home/{{ ansible_user }}/etcd-backups && ETCDCTL_API=3 etcdctl --endpoints=localhost:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key snapshot save /home/{{ ansible_user }}/etcd-backups/etcd-snapshot-$(date +%Y%m%d-%H%M).db && find /home/{{ ansible_user }}/etcd-backups -type f -mtime +7 -delete"
+  when: inventory_hostname in groups['k8s_master']
+
+# Deploy etcd cluster with proper configuration
+- name: Deploy etcd on first node
+  block:
+    - name: Backup existing etcd manifest if any
+      copy:
+        src: /etc/kubernetes/manifests/etcd.yaml
+        dest: /etc/kubernetes/manifests/etcd.yaml.bak-{{ ansible_date_time.iso8601_basic_short }}
+        remote_src: yes
+      ignore_errors: true
+      
+    - name: Create etcd manifest
+      template:
+        src: etcd.yaml.j2
+        dest: /etc/kubernetes/manifests/etcd.yaml
+        mode: '0644'
+      
+    - name: Wait for etcd to start
+      pause:
+        seconds: 20
+      
+    - name: Verify etcd health
+      shell: |
+        ETCDCTL_API=3 etcdctl \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key \
+        --endpoints=https://127.0.0.1:2379 \
+        endpoint health
+      register: etcd_health_check
+      failed_when: etcd_health_check.rc != 0
+      retries: 5
+      delay: 10
+      until: etcd_health_check.rc == 0
+  when: inventory_hostname == groups['k8s_master'][0]
+
+# Ensure other master nodes have proper etcd configuration
+- name: Configure etcd on other master nodes
+  block:
+    - name: Create etcd manifest on secondary nodes
+      template:
+        src: etcd.yaml.j2
+        dest: /etc/kubernetes/manifests/etcd.yaml
+        mode: '0644'
+      
+    - name: Wait for etcd to start on secondary nodes
+      pause:
+        seconds: 10
+  when: inventory_hostname != groups['k8s_master'][0] and inventory_hostname in groups['k8s_master']
+  
+# Clean up any excessive manifest backups
+- name: Clean up manifest backups
+  shell: |
+    find /etc/kubernetes/manifests -name "etcd.yaml.bak-*" -type f -mtime +7 -delete
+  changed_when: false
   when: inventory_hostname in groups['k8s_master']

@@ -23,7 +23,7 @@ vrrp_instance VI_1 {
     advert_int 1
     authentication {
         auth_type PASS
-        auth_pass {{ keepalived_auth_pass | default('K8sVIP') }}
+        auth_pass {{ keepalived_auth_pass }}
     }
     virtual_ipaddress {
         {{ control_plane_endpoint }}

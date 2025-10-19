@@ -1,2 +1,5 @@
-instance-id: __NODE_NAME__
+# Cloud-init meta-data for Kubernetes node
+# Ubuntu 24.04 LTS optimized configuration
+
+instance-id: __NODE_NAME__-$(date +%Y%m%d-%H%M%S)
 local-hostname: __NODE_NAME__

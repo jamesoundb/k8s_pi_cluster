@@ -52,6 +52,6 @@ backend k8s-api-backend
     timeout server 300000
     timeout connect 5000
     {% for host in groups['k8s_master'] %}
-    server apiserver{{ loop.index }} {{ hostvars[host]['ansible_host'] }}:{{ api_server_port | default('6444') }} check fall 3 rise 2
+    server apiserver{{ loop.index }} {{ hostvars[host]['ansible_host'] }}:6444 check fall 3 rise 2
     {% endfor %}
     # Dynamically generated for all control plane nodes

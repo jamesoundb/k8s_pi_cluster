@@ -2,7 +2,10 @@ apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
 nodeRegistration:
   name: {{ inventory_hostname }}
-  criSocket: "unix:///var/run/containerd/containerd.sock"
+  criSocket: "unix:///run/containerd/containerd.sock"
+localAPIEndpoint:
+  advertiseAddress: {{ ansible_default_ipv4.address }}
+  bindPort: {{ apiserver_bind_port | default('6444') }}
 bootstrapTokens:
 - groups:
   - system:bootstrappers:kubeadm:default-node-token
@@ -27,10 +30,10 @@ apiServer:
     etcd-cafile: /etc/kubernetes/pki/etcd/ca.crt
     etcd-certfile: /etc/kubernetes/pki/apiserver-etcd-client.crt
     etcd-keyfile: /etc/kubernetes/pki/apiserver-etcd-client.key
-    etcd-servers: "https://127.0.0.1:2379"
+    etcd-servers: "{% for host in groups['k8s_master'] %}https://{{ hostvars[host]['ansible_host'] }}:2379{% if not loop.last %},{% endif %}{% endfor %}"
     bind-address: "0.0.0.0"
     advertise-address: "{{ ansible_host }}"
-    secure-port: "6444"
+    secure-port: "{{ apiserver_bind_port | default('6444') }}"
     event-ttl: "1h"
     kubelet-preferred-address-types: "InternalIP,ExternalIP,Hostname"
     service-node-port-range: "30000-32767"
@@ -50,11 +53,12 @@ etcd:
       key-file: /etc/kubernetes/pki/etcd/server.key
       peer-cert-file: /etc/kubernetes/pki/etcd/peer.crt
       peer-key-file: /etc/kubernetes/pki/etcd/peer.key
-      initial-cluster: "{{ inventory_hostname }}=https://{{ ansible_default_ipv4.address }}:2380"
+      initial-cluster: "{% for host in groups['k8s_master'] %}{{ host }}=https://{{ hostvars[host]['ansible_host'] }}:2380{% if not loop.last %},{% endif %}{% endfor %}"
       initial-advertise-peer-urls: "https://{{ ansible_default_ipv4.address }}:2380"
-      initial-cluster-state: new
+      initial-cluster-state: {% if inventory_hostname in groups['k8s_master_init'] %}new{% else %}existing{% endif %}
+
       name: "{{ inventory_hostname }}"
-      listen-peer-urls: "https://{{ ansible_host }}:2380"
+      listen-peer-urls: "https://{{ ansible_host }}:2380,https://127.0.0.1:2380"
       listen-client-urls: "https://{{ ansible_host }}:2379,https://127.0.0.1:2379"
       advertise-client-urls: "https://{{ ansible_host }}:2379"
       trusted-ca-file: /etc/kubernetes/pki/etcd/ca.crt
