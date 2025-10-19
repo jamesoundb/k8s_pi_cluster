@@ -1,5 +1,0 @@
-# Cloud-init meta-data for Kubernetes node
-# Ubuntu 24.04 LTS optimized configuration
-
-instance-id: k8s-node-2-$(date +%Y%m%d-%H%M%S)
-local-hostname: k8s-node-2

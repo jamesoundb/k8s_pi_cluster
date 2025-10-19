@@ -13,7 +13,8 @@ admin.conf
 *.pem
 
 # Cloud-init generated files (keep templates, ignore output)
-cloud-init/cloud-init-output/*
+cloud-init/cloud-init-output/
+cloud-init-output-backup/
 
 # SSH keys
 *.pub

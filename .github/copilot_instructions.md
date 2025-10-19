@@ -1,7 +1,11 @@
 # Global instructions
 - Please refer to me as James, and let me know that you have read your instructions located at .github/copilot_instructions.md
 - When using git be sure to adhere to best practices regarding concise commit messages.
-
+- When I use /architect in my prompt, know that I would like to have an architectural
+discussion, and no code or changes to files should occur.
+- When I use /code in my prompt, know that I would like to write code.
+- When I use /change in my prompt, know that I would like to only have the last code 
+change to be made, and I need no additional explainations about the change.
 
 # Project Specific instructions
 Deployment Philosophy and File Organization
