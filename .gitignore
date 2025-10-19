@@ -1,1 +1,74 @@
-*.github/*
+# Ansible
+*.retry
+.ansible/
+ansible.log
+.fact_cache/
+
+# Kubernetes configs and secrets
+kubeconfig
+*.kubeconfig
+admin.conf
+*.crt
+*.key
+*.pem
+
+# Cloud-init generated files (keep templates, ignore output)
+cloud-init/cloud-init-output/*
+
+# SSH keys
+*.pub
+id_rsa*
+known_hosts
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Backup files
+*.bak
+*.backup
+*.orig
