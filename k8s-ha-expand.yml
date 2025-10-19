@@ -1,0 +1,437 @@
+---
+# Kubernetes HA Control Plane Expansion Playbook
+# Converts single-node cluster to 3-node HA control plane with full automation
+
+# [1] Prepare secondary control plane nodes
+- name: Prepare secondary control plane nodes
+  hosts: k8s_master:!k8s_master_init
+  become: true
+  roles:
+    - common
+    - containerd
+  tasks:
+    - name: Reset any existing Kubernetes configuration
+      shell: kubeadm reset -f
+      ignore_errors: true
+
+    - name: Clean up old configuration
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/etcd
+        - /var/lib/kubelet/pki
+
+    - name: Create .kube directory for user
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+# [1.5] Install Kubernetes on secondary nodes
+- name: Install Kubernetes tools on secondary nodes
+  hosts: k8s_master:!k8s_master_init
+  become: true
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        
+    - name: Install required packages for Kubernetes repository
+      apt:
+        name:
+          - curl
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+        state: present
+        
+    - name: Create keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+        
+    - name: Add Kubernetes apt signing key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        
+    - name: Add Kubernetes apt repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /"
+        state: present
+        filename: kubernetes
+        
+    - name: Update apt cache for Kubernetes packages
+      apt:
+        update_cache: yes
+        
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet={{ k8s_version }}-1.1
+          - kubeadm={{ k8s_version }}-1.1
+          - kubectl={{ k8s_version }}-1.1
+        state: present
+        
+    - name: Hold Kubernetes packages to prevent automatic updates
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+# [2] Install and configure HAProxy + Keepalived on all control plane nodes
+- name: Configure HAProxy and Keepalived for HA
+  hosts: k8s_master
+  become: true
+  tasks:
+    - name: Install Keepalived
+      apt:
+        name: 
+          - keepalived
+        state: present
+        update_cache: yes
+
+    - name: Enable IP binding to non-local addresses
+      sysctl:
+        name: net.ipv4.ip_nonlocal_bind
+        value: '1'
+        state: present
+        reload: yes
+
+    - name: Configure Keepalived
+      copy:
+        content: |
+          global_defs {
+              enable_script_security
+          }
+
+          vrrp_instance VI_1 {
+              state {% if inventory_hostname == groups['k8s_master'][0] %}MASTER{% else %}BACKUP{% endif %}
+
+              interface eth0
+              virtual_router_id 51
+              priority {% if inventory_hostname == groups['k8s_master'][0] %}110{% elif inventory_hostname == groups['k8s_master'][1] %}100{% else %}90{% endif %}
+
+              advert_int 1
+              authentication {
+                  auth_type PASS
+                  auth_pass k8svip01
+              }
+              virtual_ipaddress {
+                  192.168.1.100/24
+              }
+          }
+        dest: /etc/keepalived/keepalived.conf
+        mode: '0644'
+      notify: restart keepalived
+
+    - name: Enable and start Keepalived
+      systemd:
+        name: keepalived
+        enabled: yes
+        state: started
+        
+    - name: Wait for VIP to be established
+      wait_for:
+        host: 192.168.1.100
+        port: 22
+        timeout: 30
+        msg: "Timeout waiting for VIP to be established"
+      ignore_errors: true
+
+  handlers:
+    - name: restart keepalived
+      systemd:
+        name: keepalived
+        state: restarted
+
+# [3] Update node-1 configuration for HA
+- name: Update primary node configuration for HA
+  hosts: k8s_master_init
+  become: true
+  tasks:
+    - name: Create updated kubeadm configuration for HA
+      copy:
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          kubernetesVersion: v{{ k8s_version }}
+          controlPlaneEndpoint: 192.168.1.100:6443
+          apiServer:
+            certSANs:
+            - "192.168.1.100"  # VIP
+            - "192.168.1.80"   # node-1
+            - "192.168.1.81"   # node-2 
+            - "192.168.1.82"   # node-3
+            - "k8s-node-1"
+            - "k8s-node-2"
+            - "k8s-node-3"
+          networking:
+            podSubnet: 10.244.0.0/16
+            serviceSubnet: 10.245.0.0/16
+          etcd:
+            local:
+              dataDir: /var/lib/etcd
+          certificatesDir: /etc/kubernetes/pki
+        dest: /tmp/kubeadm-config-ha.yaml
+        mode: '0644'
+
+    - name: Regenerate API server certificates with VIP
+      shell: |
+        sudo cp -r /etc/kubernetes/pki /etc/kubernetes/pki.backup.$(date +%Y%m%d_%H%M%S)
+        sudo rm -f /etc/kubernetes/pki/apiserver.crt /etc/kubernetes/pki/apiserver.key
+        sudo kubeadm init phase certs apiserver --config=/tmp/kubeadm-config-ha.yaml
+        sudo systemctl restart kubelet
+        sleep 10
+        openssl x509 -in /etc/kubernetes/pki/apiserver.crt -text -noout | grep -A10 "Subject Alternative Name"
+      register: cert_regen_result
+
+    - name: Wait for API server to be ready with new certificate
+      wait_for:
+        port: 6443
+        host: "{{ ansible_default_ipv4.address }}"
+        delay: 10
+        timeout: 60
+
+    - name: Upload certificates to cluster
+      shell: |
+        CERT_KEY=$(openssl rand -hex 32)
+        kubeadm init phase upload-certs --upload-certs --certificate-key="$CERT_KEY" --config=/tmp/kubeadm-config-ha.yaml 2>/dev/null || echo "Certificates already uploaded" 
+        echo "$CERT_KEY"
+      register: cert_upload_result
+
+    - name: Extract certificate key for joining nodes
+      set_fact:
+        certificate_key: "{{ cert_upload_result.stdout_lines[-1] }}"
+
+    - name: Generate join token with extended TTL
+      shell: kubeadm token create --ttl=2h
+      register: join_token_result
+
+    - name: Get CA certificate hash
+      shell: openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'
+      register: ca_cert_hash_result
+
+    - name: Set join command fact using VIP
+      set_fact:
+        join_command: "kubeadm join 192.168.1.100:6443 --token {{ join_token_result.stdout }} --discovery-token-ca-cert-hash sha256:{{ ca_cert_hash_result.stdout }} --control-plane --certificate-key {{ certificate_key }} --v=5"
+
+    - name: Display join information
+      debug:
+        msg: |
+          Join command: {{ join_command }}
+          Certificate key: {{ certificate_key }}
+          Token: {{ join_token_result.stdout }}
+
+# [4] Join secondary control plane nodes
+- name: Join secondary control plane nodes
+  hosts: k8s_master:!k8s_master_init
+  become: true
+  serial: 1  # Join nodes one at a time to avoid certificate conflicts
+  vars:
+    certificate_key: "{{ hostvars[groups['k8s_master_init'][0]]['certificate_key'] }}"
+    join_command: "{{ hostvars[groups['k8s_master_init'][0]]['join_command'] }}"
+  tasks:
+    - name: Reset any existing Kubernetes configuration on secondary nodes
+      shell: kubeadm reset -f
+      ignore_errors: true
+
+    - name: Clean up old configuration files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/etcd
+        - /var/lib/kubelet/pki
+        - "/home/{{ ansible_user }}/.kube"
+
+    - name: Stop kubelet service if running
+      systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: true
+
+    # Direct certificate copy approach to avoid kubeadm certificate secret timing issues
+    - name: Copy certificates directly from primary node
+      block:
+        - name: Create certificate directories on secondary node
+          file:
+            path: "{{ item }}"
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+          loop:
+            - /etc/kubernetes/pki
+            - /etc/kubernetes/pki/etcd
+
+        - name: Copy shared CA certificates from primary node
+          fetch:
+            src: "{{ item.src }}"
+            dest: "/tmp/{{ item.dest }}"
+            flat: yes
+          delegate_to: "{{ groups['k8s_master_init'][0] }}"
+          loop:
+            - { src: "/etc/kubernetes/pki/ca.crt", dest: "ca.crt" }
+            - { src: "/etc/kubernetes/pki/ca.key", dest: "ca.key" }
+            - { src: "/etc/kubernetes/pki/sa.pub", dest: "sa.pub" }
+            - { src: "/etc/kubernetes/pki/sa.key", dest: "sa.key" }
+            - { src: "/etc/kubernetes/pki/front-proxy-ca.crt", dest: "front-proxy-ca.crt" }
+            - { src: "/etc/kubernetes/pki/front-proxy-ca.key", dest: "front-proxy-ca.key" }
+            - { src: "/etc/kubernetes/pki/etcd/ca.crt", dest: "etcd-ca.crt" }
+            - { src: "/etc/kubernetes/pki/etcd/ca.key", dest: "etcd-ca.key" }
+
+        - name: Copy certificates to secondary node
+          copy:
+            src: "{{ item.src }}"
+            dest: "{{ item.dest }}"
+            owner: root
+            group: root
+            mode: "{{ item.mode }}"
+          loop:
+            - { src: "/tmp/ca.crt", dest: "/etc/kubernetes/pki/ca.crt", mode: "0644" }
+            - { src: "/tmp/ca.key", dest: "/etc/kubernetes/pki/ca.key", mode: "0600" }
+            - { src: "/tmp/sa.pub", dest: "/etc/kubernetes/pki/sa.pub", mode: "0644" }
+            - { src: "/tmp/sa.key", dest: "/etc/kubernetes/pki/sa.key", mode: "0600" }
+            - { src: "/tmp/front-proxy-ca.crt", dest: "/etc/kubernetes/pki/front-proxy-ca.crt", mode: "0644" }
+            - { src: "/tmp/front-proxy-ca.key", dest: "/etc/kubernetes/pki/front-proxy-ca.key", mode: "0600" }
+            - { src: "/tmp/etcd-ca.crt", dest: "/etc/kubernetes/pki/etcd/ca.crt", mode: "0644" }
+            - { src: "/tmp/etcd-ca.key", dest: "/etc/kubernetes/pki/etcd/ca.key", mode: "0600" }
+
+        - name: Generate fresh join token for direct certificate join
+          shell: kubeadm token create --ttl=1h
+          delegate_to: "{{ groups['k8s_master_init'][0] }}"
+          register: direct_join_token
+
+        - name: Get current CA certificate hash
+          shell: openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'
+          register: ca_hash
+
+        - name: Join node with direct certificate approach
+          shell: |
+            echo "Joining {{ inventory_hostname }} with direct certificates"
+            kubeadm join 192.168.1.100:6443 \
+              --token {{ direct_join_token.stdout }} \
+              --discovery-token-ca-cert-hash sha256:{{ ca_hash.stdout }} \
+              --control-plane \
+              --v=5
+          register: join_result
+
+    - name: Start kubelet service on secondary nodes
+      systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    - name: Wait for kubelet to be ready on secondary nodes
+      wait_for:
+        path: /var/lib/kubelet/config.yaml
+        timeout: 120
+
+    - name: Setup kubeconfig for secondary control plane nodes
+      shell: |
+        mkdir -p /home/{{ ansible_user }}/.kube
+        sudo cp -i /etc/kubernetes/admin.conf /home/{{ ansible_user }}/.kube/config
+        sudo chown {{ ansible_user }}:{{ ansible_user }} /home/{{ ansible_user }}/.kube/config
+
+    - name: Wait for node to be ready
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes {{ inventory_hostname }} --no-headers
+      register: node_status
+      until: "'Ready' in node_status.stdout"
+      retries: 30
+      delay: 10
+      failed_when: false
+
+# [5] Deploy CNI and finalize cluster
+- name: Deploy CNI and finalize HA cluster
+  hosts: k8s_master_init
+  become: true
+  tasks:
+    - name: Wait for all control plane nodes to be joined
+      shell: kubectl get nodes --no-headers | grep control-plane | wc -l
+      register: control_plane_count
+      until: control_plane_count.stdout|int == 3
+      retries: 30
+      delay: 10
+
+    - name: Check if Flannel is already deployed
+      shell: kubectl get daemonset kube-flannel-ds -n kube-flannel
+      register: flannel_check
+      failed_when: false
+      
+    - name: Deploy Flannel CNI (only if not already deployed)
+      shell: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+      register: cni_result
+      when: flannel_check.rc != 0
+      
+    - name: Display Flannel status
+      debug:
+        msg: "Flannel is already deployed and running"
+      when: flannel_check.rc == 0
+
+    - name: Wait for all nodes to be Ready
+      shell: kubectl get nodes --no-headers | grep Ready | wc -l
+      register: ready_nodes
+      until: ready_nodes.stdout|int == 3
+      retries: 60
+      delay: 10
+
+    - name: Display final cluster status
+      shell: kubectl get nodes -o wide
+      register: final_status
+
+    - name: Show final cluster status
+      debug:
+        var: final_status.stdout_lines
+
+    - name: Check etcd cluster health
+      shell: |
+        sudo ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+        --key=/etc/kubernetes/pki/etcd/healthcheck-client.key \
+        endpoint health
+      register: etcd_health
+
+    - name: Show etcd health
+      debug:
+        var: etcd_health.stdout_lines
+
+    - name: Test VIP connectivity
+      shell: curl -k https://192.168.1.100:6443/healthz
+      register: vip_health
+      ignore_errors: true
+
+    - name: Show VIP health
+      debug:
+        var: vip_health.stdout
+
+    - name: HA cluster deployment summary
+      debug:
+        msg: |
+          ========================================
+          🎉 HA CONTROL PLANE CLUSTER COMPLETE! 
+          ========================================
+          
+          ✅ Cluster Nodes: {{ final_status.stdout_lines | length - 1 }} control plane nodes
+          ✅ etcd Cluster: {{ 'HEALTHY' if etcd_health.rc == 0 else 'NEEDS ATTENTION' }}
+          ✅ VIP (192.168.1.100): {{ 'RESPONDING' if vip_health.rc == 0 and vip_health.stdout == 'ok' else 'NEEDS ATTENTION' }}
+          ✅ CNI Network: Flannel deployed
+          
+          🔧 Control Plane Endpoint: https://192.168.1.100:6443
+          🔧 All nodes ready for workloads
+          
+          Next Steps:
+          1. Test failover: Stop one node and verify cluster remains operational  
+          2. Deploy ArgoCD: kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+          3. Add worker nodes: Use kubeadm join without --control-plane flag
+          ========================================

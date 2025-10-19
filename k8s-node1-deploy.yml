@@ -1,0 +1,285 @@
+---
+# Simplified Kubernetes Control Plane Node-1 Deployment Playbook
+
+# [0] OS Preparation
+- name: Prepare OS for Kubernetes
+  hosts: k8s_master[0]  # First control plane node only
+  become: true
+  roles:
+    - common
+
+# [1] Verify Container Runtime First
+- name: Verify containerd is installed and running properly
+  hosts: k8s_master[0]
+  become: true
+  tasks:
+    - name: Verify containerd installation
+      include_role:
+        name: containerd
+        tasks_from: verify_containerd.yml
+
+# [2] Container Runtime (full installation if needed)
+- name: Install and configure container runtime
+  hosts: k8s_master[0]
+  become: true
+  roles:
+    - containerd
+
+# [3] Install Kubernetes components
+- name: Install Kubernetes tools
+  hosts: k8s_master[0]
+  become: true
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        
+    - name: Install required packages for Kubernetes repository
+      apt:
+        name:
+          - curl
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+        state: present
+        
+    - name: Create keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+        
+    - name: Add Kubernetes apt signing key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        
+    - name: Add Kubernetes apt repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /"
+        state: present
+        filename: kubernetes
+        
+    - name: Update apt cache for Kubernetes packages
+      apt:
+        update_cache: yes
+        
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet={{ k8s_version }}-1.1
+          - kubeadm={{ k8s_version }}-1.1
+          - kubectl={{ k8s_version }}-1.1
+        state: present
+        
+    - name: Hold Kubernetes packages to prevent automatic updates
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+# [4] Reset any previous cluster and prepare for fresh installation
+- name: Reset and prepare for fresh Kubernetes installation
+  hosts: k8s_master[0]
+  become: true
+  tasks:
+    - name: Stop HAProxy and keepalived (may conflict with kubeadm init)
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - haproxy
+        - keepalived
+      ignore_errors: true
+      
+    - name: Reset kubeadm completely
+      shell: kubeadm reset -f
+      ignore_errors: true
+      
+    - name: Remove old Kubernetes configuration
+      file:
+        path: /etc/kubernetes
+        state: absent
+        
+    - name: Remove old etcd data
+      file:
+        path: /var/lib/etcd
+        state: absent
+
+# [6] Initialize Kubernetes cluster with kubeadm
+- name: Initialize Kubernetes cluster
+  hosts: k8s_master[0]
+  become: true
+  tasks:
+    - name: Create kubeadm init configuration
+      copy:
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: InitConfiguration
+          nodeRegistration:
+            name: {{ inventory_hostname }}
+            criSocket: unix:///run/containerd/containerd.sock
+          localAPIEndpoint:
+            advertiseAddress: {{ ansible_host }}
+            bindPort: 6443
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          kubernetesVersion: v{{ k8s_version }}
+          controlPlaneEndpoint: {{ ansible_host }}:6443
+          networking:
+            podSubnet: 10.244.0.0/16
+            serviceSubnet: 10.245.0.0/16
+          etcd:
+            local:
+              dataDir: /var/lib/etcd
+        dest: /tmp/kubeadm-init.yaml
+        mode: '0644'
+
+    - name: Initialize Kubernetes cluster with kubeadm
+      shell: kubeadm init --config=/tmp/kubeadm-init.yaml --v=5
+      register: kubeadm_init_result
+
+    - name: Display kubeadm init result
+      debug:
+        var: kubeadm_init_result.stdout_lines
+
+    - name: Create .kube directory for root
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0755'
+        
+    - name: Create .kube directory for regular user
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Copy kubeconfig for root user
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        mode: '0600'
+
+    - name: Copy kubeconfig for regular user  
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+        
+# [7] Deploy CNI and configure single-node
+- name: Deploy CNI network plugin and configure for single node
+  hosts: k8s_master[0]
+  become: true
+  tasks:
+    - name: Apply Flannel CNI manifest
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      register: flannel_result
+      
+    - name: Display Flannel deployment result
+      debug:
+        var: flannel_result.stdout_lines
+        
+    - name: Remove control-plane taint for single-node setup
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf taint nodes {{ inventory_hostname }} node-role.kubernetes.io/control-plane:NoSchedule-
+      register: taint_removal
+      ignore_errors: true
+      
+    - name: Display taint removal result
+      debug:
+        var: taint_removal.stdout_lines
+        
+    - name: Wait for Flannel to be ready
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-flannel -o jsonpath='{.items[0].status.phase}'
+      register: flannel_status
+      until: flannel_status.stdout == "Running"
+      retries: 12
+      delay: 10
+      ignore_errors: true
+
+# [8] Verify single-node cluster health
+- name: Verify single node cluster
+  hosts: k8s_master[0]
+  become: true
+  tasks:
+    - name: Check etcd health
+      shell: |
+        ETCDCTL_API=3 etcdctl \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key \
+        --endpoints=https://127.0.0.1:2379 \
+        endpoint health
+      register: etcd_health
+      
+    - name: Display etcd health
+      debug:
+        var: etcd_health.stdout_lines
+        
+    - name: Check API server health endpoints
+      shell: |
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw='/healthz'
+        echo "---"
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw='/readyz'
+      register: api_health
+      
+    - name: Display API server health
+      debug:
+        var: api_health.stdout_lines
+        
+    - name: Check node status
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide
+      register: node_status
+      
+    - name: Display node status
+      debug:
+        var: node_status.stdout_lines
+        
+    - name: Check all pods status
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -A
+      register: all_pods
+      
+    - name: Display all pods status
+      debug:
+        var: all_pods.stdout_lines
+        
+    - name: Run a test pod to verify cluster functionality
+      shell: |
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf run test-pod --image=nginx --dry-run=client -o yaml | kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f -
+        sleep 10
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf get pod test-pod -o wide
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf delete pod test-pod
+      register: test_pod_result
+      ignore_errors: true
+      
+    - name: Display test pod results
+      debug:
+        var: test_pod_result.stdout_lines
+        
+    - name: Single-node cluster deployment summary
+      debug:
+        msg: |
+          ========================================
+          🎉 SINGLE-NODE CLUSTER DEPLOYMENT COMPLETE! 
+          ========================================
+          
+          ✅ Cluster Status: {{ node_status.stdout_lines[1] if node_status.stdout_lines|length > 1 else 'Node status check failed' }}
+          ✅ etcd Health: {{ 'HEALTHY' if etcd_health.rc == 0 else 'FAILED' }}
+          ✅ API Server: {{ 'HEALTHY' if api_health.rc == 0 else 'FAILED' }}
+          ✅ CNI Networking: Flannel deployed
+          ✅ Pod Scheduling: {{ 'WORKING' if test_pod_result.rc == 0 else 'FAILED' }}
+          
+          Next Steps:
+          1. Verify cluster: kubectl get nodes && kubectl get pods -A
+          2. Deploy workloads or expand to HA with: ansible-playbook k8s-ha-expand.yml
+          ========================================
