@@ -201,7 +201,25 @@ kubectl --server=https://192.168.1.100:6443 get nodes
 - **Nodes NotReady**: Verify kubelet and CNI pod status
 - **Flannel issues**: Check CNI pods and network configuration
 
-## 🚀 Next Steps
+## � Cluster Reset and Recovery
+
+For testing, upgrades, or recovery scenarios, you can completely reset the cluster without re-imaging SD cards:
+
+### Complete Cluster Reset
+```bash
+# Reset all nodes to clean Ubuntu state
+ansible-playbook -i inventory.yml reset-cluster.yml
+```
+
+### Reset Options Available
+- **Complete Reset** - All nodes back to clean Ubuntu (recommended for full testing)
+- **Graceful Shutdown** - Proper cluster shutdown before maintenance
+- **Individual Node Reset** - Target specific nodes for troubleshooting
+- **Quick Reset** - Fast reset without package removal
+
+See **[Pi Node Reset Guide](docs/pi-node-reset.md)** for detailed reset procedures and options.
+
+## �🚀 Next Steps
 
 With your HA cluster operational, you're ready for:
 

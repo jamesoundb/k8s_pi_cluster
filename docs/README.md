@@ -14,6 +14,7 @@
 ### 🔧 Operations
 - **[Validation Guide](testing-plan.md)** - Health checks and performance testing
 - **[Troubleshooting](troubleshooting-guide.md)** - Common issues and solutions
+- **[Pi Node Reset Guide](pi-node-reset.md)** - Control plane node reset procedures
 
 ### 📚 Reference Documentation
 - **[Playbook Structure](playbook-structure.md)** - Ansible automation overview
@@ -40,7 +41,7 @@ All documentation reflects the **working 3-phase deployment**:
 
 **Just want to deploy?** → [Quick Start](quick-start.md)  
 **Need troubleshooting?** → [Troubleshooting Guide](troubleshooting-guide.md)  
-**Want architecture details?** → [Cluster Architecture](cluster-architecture.md)  
+**Want to reset nodes?** → [Pi Node Reset Guide](pi-node-reset.md)  
 **Setting up hardware?** → [SD Card Preparation](sd-card-preparation-and-testing.md)  
 
 ## Success Criteria
