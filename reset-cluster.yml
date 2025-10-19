@@ -1,0 +1,277 @@
+---
+# Complete Kubernetes Cluster Reset Playbook
+# Returns nodes to clean state without requiring SD card re-imaging
+
+- name: Reset Kubernetes cluster to clean state
+  hosts: all
+  become: true
+  gather_facts: false
+  serial: 1  # Reset nodes one at a time for safety
+  
+  tasks:
+    - name: Check if node is reachable
+      ping:
+      register: ping_result
+      ignore_errors: true
+      
+    - name: Skip unreachable nodes
+      meta: end_host
+      when: ping_result is failed
+      
+    - name: Display reset target
+      debug:
+        msg: "Resetting {{ inventory_hostname }} to clean state"
+
+    # Step 1: Stop all Kubernetes services
+    - name: Stop kubelet service
+      systemd:
+        name: kubelet
+        state: stopped
+        enabled: false
+      ignore_errors: true
+      
+    - name: Stop containerd service
+      systemd:
+        name: containerd
+        state: stopped
+      ignore_errors: true
+      
+    - name: Stop keepalived service (if present)
+      systemd:
+        name: keepalived
+        state: stopped
+        enabled: false
+      ignore_errors: true
+
+    # Step 2: Reset Kubernetes completely
+    - name: Run kubeadm reset
+      shell: kubeadm reset -f
+      ignore_errors: true
+      
+    - name: Remove Kubernetes configuration files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - /etc/cni/net.d
+        - /opt/cni/bin
+        - /var/lib/dockershim
+        - /var/run/kubernetes
+        - /var/lib/cni
+        - /etc/systemd/system/kubelet.service.d
+        
+    - name: Remove user kubeconfig
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /home/{{ ansible_user }}/.kube
+        - /root/.kube
+      ignore_errors: true
+
+    # Step 3: Remove Kubernetes packages
+    - name: Unhold Kubernetes packages
+      shell: apt-mark unhold kubeadm kubelet kubectl
+      ignore_errors: true
+      
+    - name: Remove Kubernetes packages
+      apt:
+        name:
+          - kubeadm
+          - kubelet  
+          - kubectl
+          - kubernetes-cni
+        state: absent
+        purge: true
+        allow_change_held_packages: true
+      ignore_errors: true
+      
+    - name: Remove containerd packages
+      apt:
+        name:
+          - containerd
+          - containerd.io
+          - runc
+        state: absent
+        purge: true
+      ignore_errors: true
+
+    # Step 4: Clean container runtime
+    - name: Stop all containers
+      shell: |
+        if command -v crictl >/dev/null 2>&1; then
+          crictl rm --force $(crictl ps -aq) 2>/dev/null || true
+          crictl rmi --prune 2>/dev/null || true
+        fi
+      ignore_errors: true
+      
+    - name: Unmount containerd filesystems
+      shell: |
+        # Unmount any busy filesystems
+        umount /run/containerd/io.containerd.runtime.v2.task/k8s.io/*/rootfs 2>/dev/null || true
+        umount /run/containerd/io.containerd.grpc.v1.cri/sandboxes/*/shm 2>/dev/null || true
+        umount -l /run/containerd 2>/dev/null || true
+      ignore_errors: true
+      
+    - name: Remove container runtime directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/containerd
+        - /var/lib/docker
+        - /run/containerd
+        - /run/docker
+        - /etc/containerd
+        - /etc/docker
+      ignore_errors: true
+
+    # Step 5: Network cleanup
+    - name: Remove CNI network interfaces
+      shell: |
+        # Remove flannel interfaces
+        ip link delete flannel.1 2>/dev/null || true
+        ip link delete cni0 2>/dev/null || true
+        ip link delete docker0 2>/dev/null || true
+        
+        # Remove any remaining veth pairs
+        for interface in $(ip link show type veth | grep -o 'veth[^:]*'); do
+          ip link delete $interface 2>/dev/null || true
+        done
+      ignore_errors: true
+      
+    - name: Flush iptables rules
+      shell: |
+        iptables -F
+        iptables -X
+        iptables -t nat -F
+        iptables -t nat -X
+        iptables -t mangle -F
+        iptables -t mangle -X
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+      ignore_errors: true
+
+    # Step 6: Clean system configuration
+    - name: Remove Kubernetes systemd services
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/kubelet.service
+        - /etc/systemd/system/containerd.service
+        - /etc/systemd/system/keepalived.service
+        - /lib/systemd/system/kubelet.service
+      ignore_errors: true
+      
+    - name: Remove Kubernetes kernel modules configuration
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/modules-load.d/k8s.conf
+        - /etc/modules-load.d/containerd.conf
+        - /etc/sysctl.d/k8s.conf
+        - /etc/sysctl.d/99-kubernetes-cri.conf
+
+    - name: Remove keepalived configuration
+      file:
+        path: /etc/keepalived
+        state: absent
+      ignore_errors: true
+
+    # Step 7: Package cleanup
+    - name: Remove Kubernetes apt sources
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        - /usr/share/keyrings/kubernetes-archive-keyring.gpg
+      ignore_errors: true
+      
+    - name: Autoremove unused packages
+      apt:
+        autoremove: true
+        autoclean: true
+      ignore_errors: true
+
+    # Step 8: System reload and verification
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: true
+        
+    - name: Reset failed systemd services
+      shell: systemctl reset-failed
+      ignore_errors: true
+
+    - name: Kill remaining Kubernetes processes
+      shell: |
+        # Kill any remaining Kubernetes processes
+        pkill -f "kube-apiserver" || true
+        pkill -f "kube-controller-manager" || true
+        pkill -f "kube-scheduler" || true
+        pkill -f "kube-proxy" || true
+        pkill -f "etcd" || true
+        pkill -f "containerd-shim" || true
+        
+        # Wait a moment for processes to terminate
+        sleep 5
+        
+        # Force kill any stubborn processes
+        pkill -9 -f "kube-apiserver" || true
+        pkill -9 -f "kube-controller-manager" || true
+        pkill -9 -f "kube-scheduler" || true
+        pkill -9 -f "kube-proxy" || true
+        pkill -9 -f "etcd" || true
+      ignore_errors: true
+      
+    - name: Verify Kubernetes is removed
+      shell: |
+        echo "=== Kubernetes Removal Verification ==="
+        echo "Kubelet status:"
+        systemctl status kubelet --no-pager -l || echo "kubelet not found (good)"
+        echo ""
+        echo "Remaining Kubernetes processes:"
+        ps aux | grep -E "(kube|etcd|containerd)" | grep -v grep || echo "No Kubernetes processes (good)"
+        echo ""
+        echo "Port check (should be free):"
+        netstat -tulpn | grep -E "(6443|10259|10257|2379|2380)" || echo "Kubernetes ports are free (good)"
+        echo ""
+        echo "Remaining Kubernetes files:"
+        find /etc /var/lib -name "*kube*" -o -name "*etcd*" 2>/dev/null | head -10 || echo "No major Kubernetes files found"
+        echo ""
+        echo "Network interfaces:"
+        ip link show | grep -E "(flannel|cni|docker)" || echo "No container network interfaces (good)"
+      register: verification_result
+      ignore_errors: true
+      
+    - name: Display verification results
+      debug:
+        var: verification_result.stdout_lines
+
+    - name: Node reset complete
+      debug:
+        msg: |
+          ✅ Node {{ inventory_hostname }} reset complete!
+          
+          The node is now in a clean state and ready for:
+          - Fresh Kubernetes deployment
+          - Cloud-init re-application (if needed)
+          - Manual configuration
+          
+          Next steps:
+          1. Reboot node (recommended): Will be done automatically next
+          2. Deploy fresh cluster: ansible-playbook -i inventory.yml k8s-node1-deploy.yml
+          
+          Note: SSH access and basic system packages remain intact.
+          
+    - name: Reboot node for completely clean state
+      reboot:
+        reboot_timeout: 600
+        msg: "Rebooting {{ inventory_hostname }} for completely clean state after reset"
