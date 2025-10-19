@@ -1,0 +1,195 @@
+#cloud-config
+
+# Ubuntu 24.04 LTS Cloud-Init Configuration for Kubernetes Node: __NODE_NAME__
+# Generated for user: __USERNAME__ 
+# Optimized for Raspberry Pi 4 with Ubuntu Server 24.04.2 LTS
+
+# System Information
+hostname: __NODE_NAME__
+prefer_fqdn_over_hostname: false
+manage_etc_hosts: true
+
+# User Configuration
+users:
+  - name: __USERNAME__
+    groups: [adm, dialout, cdrom, floppy, sudo, audio, dip, video, plugdev, netdev, lxd]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - __SSH_PUBLIC_KEY__
+    lock_passwd: true
+
+# Package Management
+package_update: true
+package_upgrade: true
+packages:
+  # Essential system packages
+  - curl
+  - wget
+  - vim
+  - htop
+  - net-tools
+  - software-properties-common
+  - apt-transport-https
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - unzip
+  - jq
+  - tree
+  # Network utilities
+  - bridge-utils
+  - iptables
+  - ipset
+  - conntrack
+  # System monitoring
+  - sysstat
+  - iotop
+  - dstat
+  # Development tools
+  - git
+  - make
+  - build-essential
+  # Container runtime prerequisites  
+  - containerd
+  - runc
+
+# System Configuration
+timezone: UTC
+locale: en_US.UTF-8
+
+# Kernel Modules (Essential for Kubernetes)
+bootcmd:
+  - echo 'cgroup_enable=cpuset cgroup_enable=memory cgroup_memory=1 systemd.unified_cgroup_hierarchy=1' >> /boot/firmware/cmdline.txt
+
+# Load required kernel modules
+write_files:
+  - path: /etc/modules-load.d/k8s.conf
+    content: |
+      # Kubernetes required modules
+      overlay
+      br_netfilter
+      # Flannel CNI requirements
+      ip_tables
+      ip6_tables
+      ip_conntrack
+      xt_conntrack
+      xt_MASQUERADE
+      xt_addrtype
+      xt_comment
+      xt_multiport
+      # Container runtime
+      veth
+      # Additional networking
+      nf_conntrack
+    permissions: '0644'
+    owner: root:root
+
+  - path: /etc/sysctl.d/k8s.conf  
+    content: |
+      # Kubernetes networking requirements
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward = 1
+      
+      # Performance tuning for Raspberry Pi
+      vm.swappiness = 1
+      vm.panic_on_oom = 0
+      vm.overcommit_memory = 1
+      kernel.panic = 10
+      kernel.panic_on_oops = 1
+      
+      # Network optimizations
+      net.core.somaxconn = 32768
+      net.core.rmem_max = 134217728
+      net.core.wmem_max = 134217728
+      net.ipv4.tcp_rmem = 4096 87380 134217728
+      net.ipv4.tcp_wmem = 4096 65536 134217728
+      net.ipv4.tcp_congestion_control = bbr
+      
+      # Container networking
+      net.netfilter.nf_conntrack_max = 1000000
+      net.netfilter.nf_conntrack_buckets = 250000
+    permissions: '0644'
+    owner: root:root
+
+  - path: /etc/crictl.yaml
+    content: |
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+      timeout: 10
+      debug: false
+      pull-image-on-create: false
+    permissions: '0644'
+    owner: root:root
+
+# SSH Configuration
+ssh:
+  emit_keys_to_console: false
+  ssh_deletekeys: true
+  ssh_genkeytypes: ['rsa', 'ecdsa', 'ed25519']
+
+ssh_pwauth: false
+disable_root: true
+
+# Service Configuration
+runcmd:
+  # Load kernel modules immediately
+  - modprobe overlay
+  - modprobe br_netfilter
+  
+  # Apply sysctl settings immediately
+  - sysctl --system
+  
+  # Disable swap completely (critical for Kubernetes)
+  - swapoff -a
+  - sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+  
+  # Configure containerd for Kubernetes
+  - mkdir -p /etc/containerd
+  - containerd config default > /etc/containerd/config.toml
+  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  - sed -i 's/sandbox_image = .*/sandbox_image = "registry.k8s.io\/pause:3.10.1"/' /etc/containerd/config.toml
+  
+  # Enable and start services
+  - systemctl daemon-reload
+  - systemctl enable containerd
+  - systemctl start containerd
+  
+  # GPU memory split for Raspberry Pi (optimize for headless)
+  - echo 'gpu_mem=16' >> /boot/firmware/config.txt
+  
+  # Final system optimization
+  - echo 'net.core.default_qdisc = fq' >> /etc/sysctl.d/k8s.conf
+  - sysctl -p /etc/sysctl.d/k8s.conf
+  
+  # Clean package cache
+  - apt-get autoremove -y
+  - apt-get autoclean
+
+# Power management
+power_state:
+  mode: reboot
+  timeout: 60
+  condition: true
+
+# Final message
+final_message: |
+  🎉 Cloud-init setup completed successfully!
+  
+  Node: __NODE_NAME__ 
+  User: __USERNAME__
+  IP: Will be configured via network-config
+  
+  ✅ Kernel modules loaded for Kubernetes
+  ✅ System optimized for Raspberry Pi 4
+  ✅ Container runtime (containerd) configured
+  ✅ Network settings optimized
+  ✅ SSH access configured
+  
+  Ready for Kubernetes deployment!
+  
+  Next steps:
+  1. SSH to node: ssh -i ~/.ssh/k8s_pi __USERNAME__@<node_ip>
+  2. Run Ansible playbook: k8s-node1-deploy.yml
+  3. Expand to HA cluster: k8s-ha-expand.yml
