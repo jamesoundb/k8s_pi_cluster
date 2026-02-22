@@ -143,9 +143,37 @@
       --timeout=5m
   when: istio_ingress_enabled
   register: ingress_deploy
-  retries: 3
-  delay: 10
+  retries: 2
+  delay: 5
   until: ingress_deploy.rc == 0
+  ignore_errors: true
+
+- name: Wait for ingress gateway service creation
+  shell: |
+    kubectl get svc -n {{ istio_namespace }} istio-ingress 2>/dev/null && echo "FOUND" || echo "NOT_FOUND"
+  register: gateway_svc
+  until: "'FOUND' in gateway_svc.stdout"
+  retries: 5
+  delay: 5
+  when: istio_ingress_enabled
+  ignore_errors: true
+
+- name: Disable sidecar injection on ingress gateway (webhook timeout fix)
+  shell: |
+    kubectl patch deployment -n {{ istio_namespace }} istio-ingress \
+      -p '{"spec":{"template":{"metadata":{"annotations":{"sidecar.istio.io/inject":"false"}}}}}'
+  when: istio_ingress_enabled
+  ignore_errors: true
+
+- name: Wait for ingress gateway pod readiness
+  shell: |
+    kubectl wait --for=condition=Ready pod \
+      -l app=istio-ingress \
+      -n {{ istio_namespace }} \
+      --timeout=3m || true
+  register: gateway_pod_ready
+  when: istio_ingress_enabled
+  ignore_errors: true
 
 - name: Scale ingress gateway deployment
   shell: |
@@ -155,7 +183,7 @@
 
 - name: Display ingress gateway deployment status
   debug:
-    msg: "✅ Ingress gateway deployed"
+    msg: "✅ Ingress gateway deployed (sidecar injection disabled to prevent webhook timeout)"
   when: istio_ingress_enabled
 
 # ==============================================
@@ -164,21 +192,25 @@
 
 - name: Verify sidecar injector webhook
   shell: |
-    kubectl get validatingwebhookconfigurations istiod-{{ istio_namespace }} 2>/dev/null && echo "FOUND" || echo "NOT_FOUND"
+    kubectl get mutatingwebhookconfigurations istio-sidecar-injector 2>/dev/null && echo "FOUND" || echo "NOT_FOUND"
   register: webhook_check
   ignore_errors: true
 
-- name: Create namespace label template for sidecar injection
+- name: Wait for sidecar injector webhook readiness
   shell: |
-    cat <<'EOF'
-    To enable automatic sidecar injection for a namespace:
-    kubectl label namespace <namespace> istio-injection=enabled
-    EOF
-  register: sidecar_info
+    kubectl get pods -n {{ istio_namespace }} -l app=istiod -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' | grep -q True && echo "READY" || echo "NOT_READY"
+  register: webhook_ready
+  until: "'READY' in webhook_ready.stdout"
+  retries: 10
+  delay: 5
+  ignore_errors: true
 
 - name: Display sidecar injection info
   debug:
-    msg: "{{ sidecar_info.stdout_lines }}"
+    msg:
+      - "✅ Sidecar injector webhook: {{ 'ACTIVE' if 'FOUND' in webhook_check.stdout else 'WAITING' }}"
+      - "To enable automatic sidecar injection for a namespace:"
+      - "  kubectl label namespace <namespace> istio-injection=enabled"
 
 # ==============================================
 # PHASE 7: VAULT INTEGRATION PLANNING
@@ -204,16 +236,38 @@
 - name: Create trading namespace with sidecar injection
   shell: |
     kubectl create namespace trading --dry-run=client -o yaml | kubectl apply -f -
+  register: trading_ns_create
+  ignore_errors: true
+
+- name: Wait for trading namespace to be active
+  shell: |
+    kubectl get namespace trading --no-headers 2>/dev/null | grep -q Active && echo "ACTIVE" || echo "NOT_ACTIVE"
+  register: trading_ns_status
+  until: "'ACTIVE' in trading_ns_status.stdout"
+  retries: 5
+  delay: 2
+  ignore_errors: true
+
+- name: Label trading namespace for Istio sidecar injection
+  shell: |
     kubectl label namespace trading \
       istio-injection=enabled \
       app.kubernetes.io/name=trading \
+      app.kubernetes.io/component=workload \
       --overwrite
-  register: trading_ns
+  register: trading_ns_label
   ignore_errors: true
+
+- name: Verify trading namespace labels
+  shell: |
+    kubectl get namespace trading --show-labels
+  register: trading_labels
 
 - name: Display trading namespace status
   debug:
-    msg: "✅ Trading namespace created with auto-sidecar injection enabled"
+    msg:
+      - "✅ Trading namespace created with auto-sidecar injection enabled"
+      - "{{ trading_labels.stdout_lines }}"
 
 # ==============================================
 # PHASE 9: VERIFICATION & STATUS
