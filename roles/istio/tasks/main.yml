@@ -139,11 +139,6 @@
   shell: |
     helm upgrade --install istio-ingress istio/gateway \
       --namespace {{ istio_namespace }} \
-      --set replicas={{ istio_gateway_replicas }} \
-      --set resources.requests.cpu={{ istio_cpu_request }} \
-      --set resources.requests.memory={{ istio_memory_request }} \
-      --set resources.limits.cpu={{ istio_cpu_limit }} \
-      --set resources.limits.memory={{ istio_memory_limit }} \
       --wait \
       --timeout=5m
   when: istio_ingress_enabled
@@ -151,6 +146,12 @@
   retries: 3
   delay: 10
   until: ingress_deploy.rc == 0
+
+- name: Scale ingress gateway deployment
+  shell: |
+    kubectl patch deployment -n {{ istio_namespace }} istio-ingress -p '{"spec":{"replicas":{{ istio_gateway_replicas }}}}'
+  when: istio_ingress_enabled
+  ignore_errors: true
 
 - name: Display ingress gateway deployment status
   debug:
