@@ -1,0 +1,52 @@
+---
+# Vault role - Default variables
+
+# Vault installation settings
+vault_version: "1.16.0"
+vault_namespace: vault
+vault_image_repo: "hashicorp/vault"
+
+# HA Config (Integrated Storage - Raft backend)
+vault_replicas: 3
+vault_ui_enabled: true
+
+# Storage
+vault_storage_size: "10Gi"
+vault_storage_class: "local-storage"
+
+# Helm chart repository
+vault_helm_repo: "https://helm.releases.hashicorp.com"
+vault_helm_repo_name: "hashicorp"
+
+# Vault Server configuration
+vault_server:
+  dataStorage:
+    size: "{{ vault_storage_size }}"
+    storageClass: "{{ vault_storage_class }}"
+  ha:
+    enabled: true
+    replicas: "{{ vault_replicas }}"
+  ui:
+    enabled: "{{ vault_ui_enabled }}"
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+# Kubernetes auth method
+vault_k8s_auth_enabled: true
+vault_k8s_auth_path: kubernetes
+
+# Service account for trading agent access
+vault_trading_agent_service_account: trading-agent
+vault_trading_agent_namespace: trading
+
+# AppRole auth (for automated access)
+vault_approle_enabled: true
+
+# Audit logging
+vault_audit_logging_enabled: true
+vault_audit_storage_size: "5Gi"

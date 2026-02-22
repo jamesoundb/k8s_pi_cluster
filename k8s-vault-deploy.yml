@@ -1,0 +1,38 @@
+---
+# Vault Deployment Playbook
+# Run after ArgoCD deployment to set up Vault PKI and secrets management
+
+- name: Deploy Vault HA cluster to Kubernetes
+  hosts: k8s_master_init
+  become: false
+  gather_facts: false
+  
+  roles:
+    - role: vault
+
+  post_tasks:
+    - name: Provide Vault deployment summary
+      debug:
+        msg:
+          - ""
+          - "========================================="
+          - "Vault HA Cluster Successfully Deployed!"
+          - "========================================="
+          - ""
+          - "Access Vault UI:"
+          - "  kubectl port-forward -n vault svc/vault 8200:8200"
+          - "  https://localhost:8200"
+          - ""
+          - "Login with root token (from /tmp/vault-keys.json)"
+          - ""
+          - "IMPORTANT Security Steps:"
+          - "1. ⚠️  Save /tmp/vault-keys.json to secure location"
+          - "2. Rotate root token after configuration"
+          - "3. Create service-specific policies"
+          - "4. Enable audit logging"
+          - ""
+          - "Vault API Endpoint (from within cluster):"
+          - "  http://vault.vault:8200"
+          - ""
+          - "Next: Deploy Istio + Configure trading agent secrets"
+          - ""

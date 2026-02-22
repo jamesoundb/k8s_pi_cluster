@@ -1,0 +1,42 @@
+---
+# ArgoCD Deployment Playbook
+# Run this playbook after k8s-ha-expand.yml and k8s-post-config.yml
+
+# [1] Deploy ArgoCD to control plane cluster
+- name: Deploy ArgoCD to Kubernetes cluster
+  hosts: k8s_master_init
+  become: false
+  gather_facts: false
+  
+  roles:
+    - role: argocd
+
+  post_tasks:
+    - name: Add helpful ArgoCD access instructions
+      debug:
+        msg:
+          - ""
+          - "========================================="
+          - "ArgoCD Installation Complete!"
+          - "========================================="
+          - ""
+          - "To access the ArgoCD UI, run:"
+          - "  kubectl port-forward -n argocd svc/argocd-server 8080:443"
+          - "  Then visit: https://localhost:8080"
+          - ""
+          - "To get admin password:"
+          - "  kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+          - ""
+          - "To create Trading Agent Application, run:"
+          - "  kubectl apply -f ~/trading-agent-gitops/argocd-app.yaml"
+          - ""
+          - "To create Kubernetes secret for trading credentials, run:"
+          - "  kubectl create secret generic trading-credentials \\"
+          - "    --from-literal=SCHWAB_CLIENT_ID='...' \\"
+          - "    --from-literal=SCHWAB_CLIENT_SECRET='...' \\"
+          - "    --from-literal=DISCORD_WEBHOOK_URL='...' \\"
+          - "    --from-literal=DRY_RUN='true' \\"
+          - "    -n trading"
+          - ""
+          - "========================================="
+          - ""

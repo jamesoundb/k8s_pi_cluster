@@ -1,0 +1,148 @@
+---
+# ArgoCD role - Installation and configuration
+
+- name: Display ArgoCD installation information
+  debug:
+    msg:
+      - "Installing ArgoCD version: {{ argocd_version }}"
+      - "Namespace: {{ argocd_namespace }}"
+      - "Installation method: {{ argocd_install_method }}"
+
+# [1] Create ArgoCD namespace and label it
+- name: Create ArgoCD namespace
+  shell: |
+    kubectl create namespace {{ argocd_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+    kubectl label namespace {{ argocd_namespace }} name={{ argocd_namespace }} purpose=gitops --overwrite
+  register: namespace_result
+  changed_when: "'created' in namespace_result.stdout or 'labeled' in namespace_result.stdout"
+
+- name: Display namespace creation result
+  debug:
+    msg: "{{ namespace_result.stdout }}"
+
+# [2] Deploy ArgoCD using kubectl apply
+- name: Deploy ArgoCD manifests
+  block:
+    - name: Apply ArgoCD install manifests from official repository
+      shell: |
+        curl -sL https://raw.githubusercontent.com/argoproj/argo-cd/{{ argocd_version }}/manifests/install.yaml | kubectl apply -n {{ argocd_namespace }} -f -
+      register: argocd_deploy_result
+      retries: 3
+      delay: 10
+      until: argocd_deploy_result.rc == 0
+
+    - name: Display ArgoCD deployment result
+      debug:
+        msg: "ArgoCD manifests applied successfully"
+
+# [3] Wait for ArgoCD components to be ready
+- name: Wait for ArgoCD server deployment to be ready
+  shell: |
+    kubectl rollout status deployment/argocd-server -n {{ argocd_namespace }} --timeout=5m
+  register: server_rollout
+  retries: 3
+  delay: 10
+  until: server_rollout.rc == 0
+
+- name: Wait for ArgoCD repo-server deployment to be ready
+  shell: |
+    kubectl rollout status deployment/argocd-repo-server -n {{ argocd_namespace }} --timeout=5m
+  register: repo_rollout
+  retries: 3
+  delay: 10
+  until: repo_rollout.rc == 0
+
+- name: Wait for ArgoCD application-controller statefulset to be ready
+  shell: |
+    kubectl rollout status statefulset/argocd-application-controller -n {{ argocd_namespace }} --timeout=5m
+  register: controller_rollout
+  retries: 3
+  delay: 10
+  until: controller_rollout.rc == 0
+
+# [4] Retrieve initial admin password
+- name: Get ArgoCD initial admin secret
+  shell: |
+    kubectl get secret -n {{ argocd_namespace }} argocd-initial-admin-secret -o jsonpath='{.data.password}' 2>/dev/null | base64 -d
+  register: argocd_admin_password
+  retries: 10
+  delay: 5
+  until: argocd_admin_password.rc == 0 and argocd_admin_password.stdout | length > 0
+
+- name: Display ArgoCD admin credentials
+  debug:
+    msg:
+      - "ArgoCD admin user: admin"
+      - "ArgoCD admin password: {{ argocd_admin_password.stdout }}"
+      - "IMPORTANT: Change this password after first login!"
+      - "Access ArgoCD via: kubectl port-forward -n {{ argocd_namespace }} svc/argocd-server 8080:443"
+
+# [5] Get ArgoCD server service information
+- name: Get ArgoCD server service
+  shell: |
+    kubectl get svc -n {{ argocd_namespace }} argocd-server -o wide
+  register: argocd_service
+
+- name: Display ArgoCD service information
+  debug:
+    msg: "{{ argocd_service.stdout_lines }}"
+
+# [6] Verify all ArgoCD pods are running
+- name: Get all ArgoCD pods
+  shell: |
+    kubectl get pods -n {{ argocd_namespace }} -l app.kubernetes.io/part-of=argocd -o wide
+  register: argocd_pods
+
+- name: Display ArgoCD pods status
+  debug:
+    msg: "{{ argocd_pods.stdout_lines }}"
+
+- name: Wait for all ArgoCD pods to be running
+  shell: |
+    READY=$(kubectl get pods -n {{ argocd_namespace }} -l app.kubernetes.io/part-of=argocd --no-headers 2>/dev/null | grep -c Running || echo 0)
+    TOTAL=$(kubectl get pods -n {{ argocd_namespace }} -l app.kubernetes.io/part-of=argocd --no-headers 2>/dev/null | wc -l)
+    if [ "$READY" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+      echo "All ArgoCD pods running: $READY/$TOTAL"
+      exit 0
+    else
+      echo "Waiting for pods to start: $READY/$TOTAL running"
+      exit 1
+    fi
+  register: argocd_pods_check
+  retries: 30
+  delay: 10
+  until: argocd_pods_check.rc == 0
+
+# [7] Display deployment summary
+- name: Get current ArgoCD status
+  shell: |
+    echo "=== Deployments ===" && kubectl get deployments -n {{ argocd_namespace }} -o wide && \
+    echo "" && echo "=== StatefulSets ===" && kubectl get statefulsets -n {{ argocd_namespace }} -o wide
+  register: argocd_status
+
+- name: Display ArgoCD deployment summary
+  debug:
+    msg: "{{ argocd_status.stdout_lines }}"
+
+# [8] Final readiness message
+- name: Final ArgoCD readiness message
+  debug:
+    msg:
+      - ""
+      - "=== ArgoCD Successfully Deployed ==="
+      - "Namespace: {{ argocd_namespace }}"
+      - "Admin user: admin"
+      - "Initial password: {{ argocd_admin_password.stdout }}"
+      - ""
+      - "Access ArgoCD UI:"
+      - "  kubectl port-forward -n {{ argocd_namespace }} svc/argocd-server 8080:443"
+      - "  https://localhost:8080"
+      - ""
+      - "Login via CLI:"
+      - "  argocd login localhost:8080 --username admin --password <password>"
+      - ""
+      - "Next steps:"
+      - "1. Create a secret for GitHub repo access (if private)"
+      - "2. Create ArgoCD Application from trading-agent-gitops repo"
+      - "3. Monitor syncing: kubectl get applications -n {{ argocd_namespace }}"
+      - ""

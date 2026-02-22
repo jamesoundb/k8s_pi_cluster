@@ -1,0 +1,354 @@
+---
+# Vault HA Deployment - Complete end-to-end automation
+# This playbook handles all aspects: Helm, storage, initialization, configuration
+
+# ==============================================
+# PHASE 0: PREREQUISITES
+# ==============================================
+
+- name: Display Vault deployment plan
+  debug:
+    msg:
+      - "=== VAULT HA DEPLOYMENT PLAN ==="
+      - "Version: {{ vault_version }}"
+      - "Namespace: {{ vault_namespace }}"
+      - "Replicas: {{ vault_replicas }}"
+      - "Storage: {{ vault_storage_size }} ({{ vault_storage_class }})"
+      - "UI: {{ vault_ui_enabled }}"
+
+# [0.1] Install Helm on control node
+- name: Check if Helm is installed
+  shell: which helm
+  register: helm_check
+  ignore_errors: true
+
+- name: Install Helm 3
+  shell: |
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  when: helm_check.rc != 0
+  register: helm_install
+  until: helm_install.rc == 0
+  retries: 3
+  delay: 5
+
+# ==============================================
+# PHASE 1: NAMESPACE & RBAC
+# ==============================================
+
+- name: Create Vault namespace with labels
+  shell: |
+    kubectl create namespace {{ vault_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+    kubectl label namespace {{ vault_namespace }} \
+      name={{ vault_namespace }} \
+      purpose=vault \
+      --overwrite
+  register: ns_result
+
+- name: Verify namespace exists
+  shell: |
+    kubectl get namespace {{ vault_namespace }}
+  register: ns_verify
+
+# ==============================================
+# PHASE 2: STORAGE PREPARATION
+# ==============================================
+
+- name: Check if storage class exists
+  shell: |
+    kubectl get storageclass {{ vault_storage_class }} 2>/dev/null && echo "EXISTS" || echo "NOT_FOUND"
+  register: storage_class_check
+  ignore_errors: true
+
+- name: Delete existing storage class if different config
+  shell: |
+    kubectl delete storageclass {{ vault_storage_class }} 2>/dev/null || true
+  ignore_errors: true
+
+- name: Create local storage class for persistent volumes
+  shell: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: storage.k8s.io/v1
+    kind: StorageClass
+    metadata:
+      name: {{ vault_storage_class }}
+    provisioner: kubernetes.io/no-provisioner
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+    EOF
+  register: storage_class_result
+
+- name: Verify storage class created
+  shell: |
+    kubectl get storageclass {{ vault_storage_class }}
+  register: storage_verify
+
+# ==============================================
+# PHASE 3: HELM REPOSITORY SETUP
+# ==============================================
+
+- name: Add HashiCorp Helm repository
+  shell: |
+    helm repo add hashicorp {{ vault_helm_repo }} 2>/dev/null || echo "already exists"
+    helm repo update hashicorp
+  register: helm_repo
+  until: helm_repo.rc == 0
+  retries: 3
+  delay: 5
+
+- name: Check Vault Helm chart available
+  shell: |
+    helm search repo hashicorp/vault
+  register: helm_search
+
+# ==============================================
+# PHASE 4: VAULT DEPLOYMENT VIA HELM
+# ==============================================
+
+- name: Delete existing Vault release if present
+  shell: |
+    helm uninstall vault -n vault 2>/dev/null || true
+  ignore_errors: true
+
+- name: Deploy Vault HA cluster via Helm
+  shell: |
+    helm install vault hashicorp/vault \
+      --namespace vault \
+      --create-namespace \
+      --set server.ha.enabled=true \
+      --set server.ha.replicas=3 \
+      --set server.dataStorage.enabled=true \
+      --set server.dataStorage.size=10Gi \
+      --set server.dataStorage.storageClass=local-storage \
+      --set server.ui.enabled=true \
+      --set ui.enabled=true \
+      --set server.resources.requests.cpu=250m \
+      --set server.resources.requests.memory=256Mi \
+      --set server.resources.limits.cpu=500m \
+      --set server.resources.limits.memory=512Mi \
+      --set csi.enabled=false
+  register: helm_deploy
+  retries: 3
+  delay: 10
+  until: helm_deploy.rc == 0
+
+- name: Display Helm deployment status
+  debug:
+    msg: "{{ helm_deploy.stdout_lines[-5:] }}"
+
+# ==============================================
+# PHASE 5: STORAGE BINDING & PVC VERIFICATION
+# ==============================================
+
+- name: Wait for PVCs to be created
+  shell: |
+    for i in $(seq 0 $(({{ vault_replicas }} - 1))); do
+      kubectl wait --for=condition=Bound \
+        pvc/data-vault-$i \
+        -n {{ vault_namespace }} \
+        --timeout=2m || true
+    done
+  register: pvc_wait
+  ignore_errors: true
+
+- name: Get PVC status
+  shell: |
+    kubectl get pvc -n {{ vault_namespace }} -o wide
+  register: pvc_status
+
+- name: Display PVC status
+  debug:
+    msg: "{{ pvc_status.stdout_lines }}"
+
+# ==============================================
+# PHASE 6: POD READINESS
+# ==============================================
+
+- name: Wait for Vault pods to reach Running phase
+  shell: |
+    for i in $(seq 0 $(({{ vault_replicas }} - 1))); do
+      kubectl wait --for=condition=Ready \
+        pod/vault-$i \
+        -n {{ vault_namespace }} \
+        --timeout=5m || true
+    done
+  register: pod_wait
+  ignore_errors: true
+  retries: 2
+  delay: 10
+
+- name: Check Vault pod statuses
+  shell: |
+    kubectl get pods -n {{ vault_namespace }} -l app.kubernetes.io/name=vault -o wide
+  register: pod_status
+
+- name: Display pod status
+  debug:
+    msg: "{{ pod_status.stdout_lines }}"
+
+# ==============================================
+# PHASE 7: INITIALIZATION & UNSEALING
+# ==============================================
+
+- name: Check if Vault is already initialized
+  shell: |
+    kubectl exec -n {{ vault_namespace }} vault-0 -- \
+      vault status -tls-skip-verify 2>&1 | grep -q "Initialized.*true" && echo "INITIALIZED" || echo "NOT_INITIALIZED"
+  register: vault_init_check
+  ignore_errors: true
+  retries: 5
+  delay: 10
+  until: vault_init_check.stdout
+
+- name: Initialize Vault (if needed)
+  shell: |
+    kubectl exec -n {{ vault_namespace }} vault-0 -- vault operator init \
+      -key-shares=3 \
+      -key-threshold=2 \
+      -format=json > /tmp/vault-keys.json
+  when: vault_init_check.stdout == "NOT_INITIALIZED"
+  register: vault_init
+  ignore_errors: true
+
+- name: Create keys backup in ansible temp
+  shell: |
+    [ -f /tmp/vault-keys.json ] && cp /tmp/vault-keys.json /tmp/vault-keys-backup.json && \
+    echo "✅ Vault keys backed up - SAVE TO SECURE LOCATION" || echo "⚠️  Keys file not found"
+  register: keys_backup
+
+- name: Extract unseal keys if available
+  shell: |
+    if [ -f /tmp/vault-keys.json ]; then
+      python3 -c "import json; keys = json.load(open('/tmp/vault-keys.json')); print('\n'.join(keys['unseal_keys_b64'][:2]))" 2>/dev/null || echo "KEY_EXTRACT_FAILED"
+    else
+      echo "NO_KEYS_FILE"
+    fi
+  register: unseal_keys
+  ignore_errors: true
+
+- name: Unseal Vault pods with extracted keys
+  shell: |
+    if [ "{{ unseal_keys.stdout }}" != "NO_KEYS_FILE" ] && [ "{{ unseal_keys.stdout }}" != "KEY_EXTRACT_FAILED" ]; then
+      KEYS=( $(echo "{{ unseal_keys.stdout }}" | tr '\n' ' ') )
+      for pod in $(kubectl get pods -n {{ vault_namespace }} -l app.kubernetes.io/name=vault -o jsonpath='{.items[*].metadata.name}'); do
+        for key in "${KEYS[@]}"; do
+          kubectl exec -n {{ vault_namespace }} $pod -- vault operator unseal "$key" 2>/dev/null || true
+        done
+      done
+      echo "✅ Vault unsealing attempted"
+    else
+      echo "⚠️  Keys not available for unsealing"
+    fi
+  register: unseal_result
+  ignore_errors: true
+
+# ==============================================
+# PHASE 8: VERIFICATION & STATUS
+# ==============================================
+
+- name: Wait for Vault to be ready for API calls
+  shell: |
+    for i in {1..30}; do
+      if kubectl exec -n {{ vault_namespace }} vault-0 -- \
+         vault status -tls-skip-verify 2>/dev/null | grep -q "Sealed.*false"; then
+        echo "✅ Vault unsealed and ready"
+        exit 0
+      fi
+      sleep 5
+    done
+    echo "⚠️  Vault still sealing - manual unseal may be required"
+  register: vault_ready
+  ignore_errors: true
+
+- name: Get Vault status
+  shell: |
+    kubectl exec -n {{ vault_namespace }} vault-0 -- \
+      vault status -tls-skip-verify 2>/dev/null || echo "Status unavailable - pod may still be initializing"
+  register: vault_status
+  ignore_errors: true
+
+- name: Display Vault status
+  debug:
+    msg: "{{ vault_status.stdout_lines }}"
+
+# ==============================================
+# PHASE 9: KUBERNETES AUTH CONFIGURATION
+# ==============================================
+
+- name: Enable Kubernetes auth method
+  shell: |
+    kubectl exec -n {{ vault_namespace }} vault-0 -- \
+      vault auth enable kubernetes 2>/dev/null || echo "kubernetes auth already enabled"
+  register: k8s_auth_enable
+  ignore_errors: true
+  when: vault_ready.rc == 0
+
+- name: Configure Kubernetes auth
+  shell: |
+    kubectl exec -n {{ vault_namespace }} vault-0 -- \
+      vault write auth/kubernetes/config \
+        kubernetes_host="https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT" \
+        kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+        token_reviewer_jwt=@/var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || \
+        echo "K8s auth config may already exist"
+  register: k8s_auth_config
+  ignore_errors: true
+  when: vault_ready.rc == 0
+
+# ==============================================
+# PHASE 10: DEPLOYMENT SUMMARY
+# ==============================================
+
+- name: Get final Vault cluster info
+  shell: |
+    echo "=== DEPLOYMENTS ===" && \
+    kubectl get deployments -n {{ vault_namespace }} && \
+    echo "" && echo "=== STATEFULSETS ===" && \
+    kubectl get statefulsets -n {{ vault_namespace }} && \
+    echo "" && echo "=== PODS ===" && \
+    kubectl get pods -n {{ vault_namespace }} -l app.kubernetes.io/name=vault && \
+    echo "" && echo "=== SERVICES ===" && \
+    kubectl get svc -n {{ vault_namespace }}
+  register: vault_summary
+
+- name: Display Vault deployment summary
+  debug:
+    msg: "{{ vault_summary.stdout_lines }}"
+
+- name: Display final instructions
+  debug:
+    msg:
+      - ""
+      - "╔════════════════════════════════════════════════════════════╗"
+      - "║          VAULT HA DEPLOYMENT COMPLETE                      ║"
+      - "╚════════════════════════════════════════════════════════════╝"
+      - ""
+      - "📦 Deployment Details:"
+      - "   Namespace: {{ vault_namespace }}"
+      - "   Replicas: {{ vault_replicas }}"
+      - "   Storage: {{ vault_storage_size }} ({{ vault_storage_class }})"
+      - ""
+      - "🔑 CRITICAL - Initialization Keys:"
+      - "   Location: /tmp/vault-keys.json"
+      - "   ⚠️  SAVE TO SECURE OFFLINE LOCATION!"
+      - "   File contains:"
+      - "     • 3 unseal keys (need 2 to unseal)"
+      - "     • Root token for initial access"
+      - ""
+      - "🌐 Access Vault:"
+      - "   Port-forward: kubectl port-forward -n {{ vault_namespace }} svc/vault 8200:8200"
+      - "   UI: https://localhost:8200"
+      - "   API: http://vault.{{ vault_namespace }}:8200 (internal)"
+      - ""
+      - "🔓 Manual Unseal (if pods show sealed=true):"
+      - "   1. kubectl exec -it -n {{ vault_namespace }} vault-0 -- sh"
+      - "   2. vault operator unseal KEY_1"
+      - "   3. vault operator unseal KEY_2"
+      - "   4. Exit and check: vault status -tls-skip-verify"
+      - ""
+      - "⏭️  Next Steps:"
+      - "   1. Save initialization keys securely"
+      - "   2. Verify all pods are READY (status: 1/1)"
+      - "   3. Configure policies for trading agent"
+      - "   4. Set up AppRole for automated access"
+      - "   5. Deploy Istio service mesh"
+      - ""

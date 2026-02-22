@@ -1,0 +1,80 @@
+---
+# ArgoCD role - Default variables
+
+# ArgoCD installation method
+argocd_install_method: kubectl  # Options: kubectl, helm
+argocd_version: v2.10.0
+
+# ArgoCD namespace
+argocd_namespace: argocd
+
+# ArgoCD API server configuration
+argocd_server_replicas: 3
+argocd_server_insecure: false  # Use HTTPS by default
+
+# Controller configuration
+argocd_repo_server_replicas: 2
+argocd_application_controller_replicas: 2
+
+# ArgoCD Repository settings
+argocd_git_repositories: []
+# Example:
+# - name: trading-agent-gitops
+#   repo: https://github.com/yourusername/trading-agent-gitops.git
+#   type: git
+#   password: ""  # Leave blank for public repos
+
+# ArgoCD Application settings
+argocd_applications: []
+# Example:
+# - name: trading-agent
+#   namespace: argocd
+#   project: default
+#   repo_url: https://github.com/yourusername/trading-agent-gitops.git
+#   target_branch: main
+#   path: manifests
+#   dest_server: https://kubernetes.default.svc
+#   dest_namespace: trading
+#   sync_policy: manual  # manual or auto
+
+# ArgoCD admin password (generated if not set)
+argocd_admin_password: ""
+
+# Resource limits
+argocd_resources:
+  server:
+    requests:
+      memory: "128Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+  controller:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+  repo_server:
+    requests:
+      memory: "128Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+# SSL/TLS configuration
+argocd_tls_enabled: false
+argocd_tls_cert_path: ""
+argocd_tls_key_path: ""
+
+# Sync configuration
+argocd_default_sync_timeout: "300s"
+argocd_application_defaults: |
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: false
+    syncOptions:
+    - CreateNamespace=true
