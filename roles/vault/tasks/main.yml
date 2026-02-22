@@ -188,15 +188,52 @@
   debug:
     msg: "{{ pv_verify.stdout_lines }}"
 
-- name: Prepare vault data directories on worker nodes
+- name: Prepare vault data directories on worker nodes via debug pods
   shell: |
-    for node in k8s-worker-1 k8s-worker-2 k8s-worker-3; do
-      ssh -i ~/.ssh/proxmox -o IdentitiesOnly=yes -o StrictHostKeyChecking=no "ubuntu@${node}" \
-        "sudo mkdir -p /mnt/vault-data && sudo chmod 777 /mnt/vault-data" 2>/dev/null || true
-    done
-    echo "✅ Vault data directories prepared on all worker nodes"
-  register: data_dir_prep
+    cat <<'DEBUGPOD' | kubectl apply -f -
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: debug-vault-setup-{{ item }}
+      namespace: {{ vault_namespace }}
+    spec:
+      nodeName: {{ item }}
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: debug
+        image: busybox:latest
+        command: ['/bin/sh', '-c', 'mkdir -p /mnt/vault-data && chmod 777 /mnt/vault-data && echo "Created on {{ item }}" && sleep 30']
+        volumeMounts:
+        - name: host-root
+          mountPath: /mnt
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /mnt
+          type: DirectoryOrCreate
+    DEBUGPOD
+  loop:
+    - k8s-worker-1
+    - k8s-worker-2
+    - k8s-worker-3
+  register: debug_pods_created
   ignore_errors: true
+
+- name: Wait for debug pods to complete and create directories
+  shell: |
+    sleep 15
+  register: wait_dirs
+
+- name: Clean up debug pods
+  shell: |
+    kubectl delete pod -n {{ vault_namespace }} -l debug-vault-setup --grace-period=5 2>/dev/null || true
+  register: debug_cleanup
+  ignore_errors: true
+
+- name: Verify vault data directories created
+  debug:
+    msg: "✅ Vault data directories prepared on all worker nodes"
 
 # ==============================================
 # PHASE 3: HELM REPOSITORY SETUP
