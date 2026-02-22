@@ -1,0 +1,11 @@
+---
+# Istio Service Mesh Deployment Playbook
+# Deploys Istio HA control plane and ingress gateway to Kubernetes cluster
+
+- name: Deploy Istio Service Mesh to Kubernetes
+  hosts: k8s-node-1
+  gather_facts: yes
+  vars_files:
+    - roles/istio/defaults/main.yml
+  roles:
+    - istio

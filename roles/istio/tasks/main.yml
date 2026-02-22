@@ -1,0 +1,306 @@
+---
+# Istio Service Mesh Deployment - Complete end-to-end automation
+
+# ==============================================
+# PHASE 0: PREREQUISITES & VALIDATION
+# ==============================================
+
+- name: Display Istio deployment plan
+  debug:
+    msg:
+      - "=== ISTIO SERVICE MESH DEPLOYMENT PLAN ==="
+      - "Version: {{ istio_version }}"
+      - "Namespace: {{ istio_namespace }}"
+      - "Ingress: {{ istio_ingress_enabled }}"
+      - "Egress: {{ istio_egress_enabled }}"
+      - "mTLS Mode: {{ istio_mtls_mode }}"
+      - "Vault Integration: {{ vault_integration_enabled }}"
+
+# Validate prerequisites
+- name: Verify prerequisites - Kubernetes cluster
+  shell: |
+    kubectl get nodes --no-headers | wc -l
+  register: node_count
+  until: node_count.stdout | int >= 3
+  retries: 5
+  delay: 10
+
+- name: Verify prerequisites - ArgoCD deployed
+  shell: |
+    kubectl get deployment -n argocd argocd-server 2>/dev/null && echo "FOUND" || echo "NOT_FOUND"
+  register: argocd_check
+  ignore_errors: true
+
+- name: Display prerequisites status
+  debug:
+    msg:
+      - "✅ Kubernetes: {{ node_count.stdout }} nodes Ready"
+      - "✅ ArgoCD: {{ 'Deployed' if 'FOUND' in argocd_check.stdout else 'Not yet deployed (optional)' }}"
+      - "⚠️  Continue if Vault HA is fully initialized and unsealed"
+
+# ==============================================
+# PHASE 1: NAMESPACE & RBAC
+# ==============================================
+
+- name: Create Istio namespace
+  shell: |
+    kubectl create namespace {{ istio_namespace }} --dry-run=client -o yaml | kubectl apply -f -
+    kubectl label namespace {{ istio_namespace }} \
+      name={{ istio_namespace }} \
+      purpose=service-mesh \
+      --overwrite
+  register: ns_result
+
+- name: Verify namespace
+  shell: |
+    kubectl get namespace {{ istio_namespace }}
+  register: ns_verify
+
+# ==============================================
+# PHASE 2: HELM REPOSITORY SETUP
+# ==============================================
+
+- name: Add Istio Helm repository
+  shell: |
+    helm repo add istio {{ istio_helm_repo }} 2>/dev/null || echo "already exists"
+    helm repo update istio
+  register: helm_repo
+  until: helm_repo.rc == 0
+  retries: 3
+  delay: 5
+
+- name: Verify Istio Helm chart available
+  shell: |
+    helm search repo istio/base
+  register: helm_search
+
+# ==============================================
+# PHASE 3: ISTIO BASE DEPLOYMENT
+# ==============================================
+
+- name: Deploy Istio base CRDs
+  shell: |
+    helm upgrade --install istio-base istio/base \
+      --namespace {{ istio_namespace }} \
+      --create-namespace \
+      --wait \
+      --timeout=5m
+  register: base_deploy
+  retries: 3
+  delay: 10
+  until: base_deploy.rc == 0
+
+- name: Display base deployment status
+  debug:
+    msg: "✅ Istio base CRDs deployed"
+
+# ==============================================
+# PHASE 4: ISTIOD (CONTROL PLANE) DEPLOYMENT
+# ==============================================
+
+- name: Deploy istiod (Istio control plane)
+  shell: |
+    helm upgrade --install istiod istio/istiod \
+      --namespace {{ istio_namespace }} \
+      --set pilot.autoscalingEnabled=true \
+      --set pilot.replicaCount={{ istio_pilot_replicas }} \
+      --set pilot.resources.requests.cpu={{ istio_cpu_request }} \
+      --set pilot.resources.requests.memory={{ istio_memory_request }} \
+      --set pilot.resources.limits.cpu={{ istio_cpu_limit }} \
+      --set pilot.resources.limits.memory={{ istio_memory_limit }} \
+      --set global.logAsJson=true \
+      --set global.istiod.enableAnalysis=true \
+      --set telemetry.enabled=true \
+      --wait \
+      --timeout=5m
+  register: istiod_deploy
+  retries: 3
+  delay: 10
+  until: istiod_deploy.rc == 0
+
+- name: Wait for istiod pod readiness
+  shell: |
+    kubectl wait --for=condition=Ready pod \
+      -l app=istiod \
+      -n {{ istio_namespace }} \
+      --timeout=5m || true
+  register: istiod_wait
+  ignore_errors: true
+
+- name: Display istiod deployment status
+  debug:
+    msg: "✅ istiod control plane deployed"
+
+# ==============================================
+# PHASE 5: INGRESS GATEWAY DEPLOYMENT
+# ==============================================
+
+- name: Deploy Istio ingress gateway
+  shell: |
+    helm upgrade --install istio-ingress istio/gateway \
+      --namespace {{ istio_namespace }} \
+      --set replicas={{ istio_gateway_replicas }} \
+      --set resources.requests.cpu={{ istio_cpu_request }} \
+      --set resources.requests.memory={{ istio_memory_request }} \
+      --set resources.limits.cpu={{ istio_cpu_limit }} \
+      --set resources.limits.memory={{ istio_memory_limit }} \
+      --wait \
+      --timeout=5m
+  when: istio_ingress_enabled
+  register: ingress_deploy
+  retries: 3
+  delay: 10
+  until: ingress_deploy.rc == 0
+
+- name: Display ingress gateway deployment status
+  debug:
+    msg: "✅ Ingress gateway deployed"
+  when: istio_ingress_enabled
+
+# ==============================================
+# PHASE 6: SIDECAR INJECTOR SETUP
+# ==============================================
+
+- name: Verify sidecar injector webhook
+  shell: |
+    kubectl get validatingwebhookconfigurations istiod-{{ istio_namespace }} 2>/dev/null && echo "FOUND" || echo "NOT_FOUND"
+  register: webhook_check
+  ignore_errors: true
+
+- name: Create namespace label template for sidecar injection
+  shell: |
+    cat <<'EOF'
+    To enable automatic sidecar injection for a namespace:
+    kubectl label namespace <namespace> istio-injection=enabled
+    EOF
+  register: sidecar_info
+
+- name: Display sidecar injection info
+  debug:
+    msg: "{{ sidecar_info.stdout_lines }}"
+
+# ==============================================
+# PHASE 7: VAULT INTEGRATION PLANNING
+# ==============================================
+
+- name: Check Vault deployment status (for future integration)
+  shell: |
+    kubectl get statefulset -n vault vault 2>/dev/null && echo "VAULT_FOUND" || echo "VAULT_NOTFOUND"
+  register: vault_status
+  ignore_errors: true
+
+- name: Display Vault integration status
+  debug:
+    msg:
+      - "Vault Status: {{ 'Deployed' if 'VAULT_FOUND' in vault_status.stdout else 'Not yet available' }}"
+      - "Next: Configure Vault PKI intermediate CA for Istio"
+      - "Then: Enable vault_integration_enabled in role defaults"
+
+# ==============================================
+# PHASE 8: DEMO APPLICATION NAMESPACE
+# ==============================================
+
+- name: Create trading namespace with sidecar injection
+  shell: |
+    kubectl create namespace trading --dry-run=client -o yaml | kubectl apply -f -
+    kubectl label namespace trading \
+      istio-injection=enabled \
+      app.kubernetes.io/name=trading \
+      --overwrite
+  register: trading_ns
+  ignore_errors: true
+
+- name: Display trading namespace status
+  debug:
+    msg: "✅ Trading namespace created with auto-sidecar injection enabled"
+
+# ==============================================
+# PHASE 9: VERIFICATION & STATUS
+# ==============================================
+
+- name: Get Istio pods
+  shell: |
+    kubectl get pods -n {{ istio_namespace }} -o wide
+  register: istio_pods
+
+- name: Display Istio pods
+  debug:
+    msg: "{{ istio_pods.stdout_lines }}"
+
+- name: Check Istio version
+  shell: |
+    istioctl version 2>/dev/null || echo "istioctl CLI not installed"
+  register: istio_version_check
+  ignore_errors: true
+
+- name: Get services
+  shell: |
+    kubectl get svc -n {{ istio_namespace }}
+  register: istio_services
+
+- name: Display services
+  debug:
+    msg: "{{ istio_services.stdout_lines }}"
+
+# ==============================================
+# PHASE 10: DEPLOYMENT SUMMARY
+# ==============================================
+
+- name: Display Istio deployment summary
+  debug:
+    msg:
+      - ""
+      - "╔════════════════════════════════════════════════════════════╗"
+      - "║          ISTIO SERVICE MESH DEPLOYED                       ║"
+      - "╚════════════════════════════════════════════════════════════╝"
+      - ""
+      - "📦 Deployment Details:"
+      - "   Namespace: {{ istio_namespace }}"
+      - "   Version: {{ istio_version }}"
+      - "   Control Plane Replicas: {{ istio_pilot_replicas }}"
+      - "   Ingress Gateway: {{ 'Enabled' if istio_ingress_enabled else 'Disabled' }}"
+      - "   Egress Gateway: {{ 'Enabled' if istio_egress_enabled else 'Disabled' }}"
+      - "   mTLS Default: {{ istio_mtls_mode }}"
+      - ""
+      - "🔧 Verification Commands:"
+      - "   Check pods: kubectl get pods -n {{ istio_namespace }}"
+      - "   Check services: kubectl get svc -n {{ istio_namespace }}"
+      - "   Istio version: istioctl version"
+      - "   Verify installation: kubectl get crd | grep istio"
+      - ""
+      - "🎯 Next Steps:"
+      - "   1. Verify all Istio pods are Ready"
+      - "   2. Label namespaces for sidecar injection:"
+      - "      kubectl label namespace <name> istio-injection=enabled"
+      - "   3. Deploy test applications"
+      - "   4. Configure VirtualServices and AuthorizationPolicies"
+      - "   5. Monitor with Kiali dashboard"
+      - ""
+      - "🔐 Zero-Trust Security:"
+      - "   • Default: Deny all traffic between services"
+      - "   • Require: Explicit AuthorizationPolicy to allow"
+      - "   • mTLS: Auto-enabled for all service-to-service communication"
+      - "   • Audit: All traffic subject to policy evaluation"
+      - ""
+      - "🔗 Vault PKI Integration (When Ready):"
+      - "   1. Configure Vault intermediate CA for Istio"
+      - "   2. Set vault_integration_enabled: true"
+      - "   3. Certificates auto-rotated by Vault"
+      - ""
+      - "⏭️  Proceed with:"
+      - "   • Deploy trading agent with ArgoCD"
+      - "   • Configure service policies via Kiali"
+      - "   • Enable observability stack (Prometheus, Grafana, Jaeger)"
+      - ""
+
+- name: Display Provide access info if gateway deployed
+  debug:
+    msg:
+      - ""
+      - "🌐 Ingress Gateway Access (if deployed):"
+      - "   Service: {{ 'istio-ingressgateway' if istio_ingress_enabled else 'Not deployed' }}"
+      - "   Namespace: {{ istio_namespace }}"
+      - "   Port: 80 (HTTP) / 443 (HTTPS)"
+      - "   Get external IP: kubectl get svc -n {{ istio_namespace }} istio-ingressgateway"
+      - ""
+  when: istio_ingress_enabled

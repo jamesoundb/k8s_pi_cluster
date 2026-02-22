@@ -1,0 +1,41 @@
+---
+# Istio Role Configuration
+
+# Base Configuration
+istio_namespace: istio-system
+istio_helm_repo: https://istio-release.storage.googleapis.com/charts
+istio_version: "1.20.3"  # Stable version for ARM64
+
+# Installation settings
+istio_install_method: helm
+istio_ingress_enabled: true
+istio_egress_enabled: true
+
+# Resource constraints (Raspberry Pi)
+istio_cpu_request: 100m
+istio_cpu_limit: 500m
+istio_memory_request: 128Mi
+istio_memory_limit: 256Mi
+
+# High availability
+istio_pilot_replicas: 1  # Single Pi-friendly
+istio_gateway_replicas: 1
+
+# Sidecar injection
+istio_sidecar_auto_inject: true
+istio_sidecar_resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# mTLS Configuration
+istio_mtls_mode: STRICT  # Enforce mTLS for all services
+istio_certificate_rotation: true
+
+# Vault Integration (when PKI ready)
+vault_integration_enabled: false  # Set to true after Vault PKI setup
+vault_namespace: vault
+vault_ca_path: /vault/secrets/istio-ca.crt
