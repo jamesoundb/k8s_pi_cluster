@@ -81,10 +81,29 @@ Open: http://192.168.1.80:30080
 
 ## Next Steps
 
-1. **Deploy Applications**: Use `kubectl apply` or Helm charts
-2. **Add Worker Nodes**: Join Proxmox VMs for dedicated workloads  
-3. **Install Service Mesh**: Deploy Istio for advanced networking
-4. **Setup GitOps**: Install ArgoCD for automated deployments
+Once your 3-node cluster is operational:
+
+1. **Deploy ArgoCD**: GitOps controller for application management
+   ```bash
+   ansible-playbook -i inventory.yml k8s-argocd-deploy.yml
+   ```
+   
+2. **Deploy Vault**: Secrets and PKI management
+   ```bash
+   ansible-playbook -i inventory.yml k8s-vault-deploy.yml
+   ```
+
+3. **Deploy Istio**: Service mesh for zero-trust networking (next)
+   ```bash
+   ansible-playbook -i inventory.yml k8s-istio-deploy.yml  # Coming soon
+   ```
+
+4. **Deploy Applications**: Use GitOps manifests or Helm charts
+   - Trading agent via ArgoCD
+   - Vault policies and authentication
+   - Istio traffic policies
+
+See [ArgoCD Deployment](argocd-deployment.md), [Vault Deployment](vault-deployment.md) for detailed setup.
 
 ## Need Help?
 

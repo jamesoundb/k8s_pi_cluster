@@ -32,19 +32,37 @@ Production-ready 3-node HA Kubernetes cluster on Raspberry Pi hardware with auto
 - Browser-accessible test services via NodePort
 - Complete infrastructure-as-code approach
 
-## Evolution Path: Service Mesh & Zero Trust
+## Current Infrastructure Services ✅
 
-### Phase 2: Service Mesh Foundation
-- **Istio Control Plane**: Deploy on existing HA cluster
-- **Worker Node Addition**: Join Proxmox VMs as worker nodes
-- **GitOps Setup**: ArgoCD for application deployment
-- **Basic Service Mesh**: Sidecar injection and mTLS
+### Phase 2: Infrastructure Services (In Progress)
+
+**✅ ArgoCD Deployed**
+- GitOps controller managing application deployments
+- Namespace: `argocd` (7 pods, all Running)
+- Admin credentials: username=`admin`, password displayed during deployment
+- Ready to manage: `trading-agent-gitops` Git repository
+- Access: `kubectl port-forward -n argocd svc/argocd-server 8080:443`
+
+**⏳ Vault HA Deploying**
+- 3-replica Raft backend launching on control plane nodes
+- Namespace: `vault` (storage and pods initializing)
+- Storage: local-storage provisioner with 10Gi per pod
+- Features: Kubernetes auth, AppRole, PKI root CA
+- Next: Manual initialization and unsealing (keys in `/tmp/vault-keys.json`)
+
+**📋 Istio Service Mesh (Planned)**
+- Deploys after Vault stabilization
+- Requires: Vault HA operational, PKI configured
+- Provides: mTLS, traffic management, policy enforcement
+- Integration: Istio CA ↔ Vault intermediate CA certificate chain
+
+### Evolution Path: Service Mesh & Zero Trust
 
 ### Phase 3: Advanced Service Mesh
-- **Vault PKI Root CA**: Replace direct certificate management
+- **Istio Sidecar Injection**: Automatic mTLS for services
 - **Zero Trust Networking**: Policy-driven service communication  
 - **Observability Stack**: Prometheus, Grafana, Jaeger, Kiali
-- **Application Deployment**: Bitwarden, Mattermost, GitLab, Pi-hole
+- **Application Deployment**: Trading agent, Bitwarden, Mattermost, GitLab, Pi-hole
 
 ### Future Architecture Vision
 ```

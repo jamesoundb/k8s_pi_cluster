@@ -11,6 +11,11 @@
 - **[Cluster Architecture](cluster-architecture.md)** - Current design and evolution path
 - **[SD Card Preparation](sd-card-preparation-and-testing.md)** - Hardware setup guide
 
+### 📦 Service Deployment Guides
+- **[ArgoCD Deployment](argocd-deployment.md)** - GitOps controller setup
+- **[Vault Deployment](vault-deployment.md)** - PKI and secrets management
+- **[Istio Setup](istio-deployment.md)** - Service mesh and zero-trust networking (Coming)
+
 ### 🔧 Operations
 - **[Validation Guide](testing-plan.md)** - Health checks and performance testing
 - **[Troubleshooting](troubleshooting-guide.md)** - Common issues and solutions
@@ -25,11 +30,18 @@
 
 ## Documentation Strategy
 
-### Current Focus
-All documentation reflects the **working 3-phase deployment**:
+### Current Focus (Phase 2: Infrastructure Services)
+All documentation reflects the **working deployment with infrastructure services**:
+
+**Phase 1: Cluster Foundation** ✅ COMPLETE
 1. `k8s-node1-deploy.yml` - Foundation cluster
 2. `k8s-ha-expand.yml` - HA expansion with VIP failover
 3. `k8s-post-config.yml` - Validation and browser access
+
+**Phase 2: Infrastructure Services** ✅ IN-PROGRESS
+- `k8s-argocd-deploy.yml` - GitOps controller (DEPLOYED)
+- `k8s-vault-deploy.yml` - Vault HA cluster (DEPLOYING)
+- `k8s-istio-deploy.yml` - Service mesh (PLANNED)
 
 ### Automation Philosophy
 - **Pure Ansible**: All operations embedded in playbooks
@@ -40,16 +52,23 @@ All documentation reflects the **working 3-phase deployment**:
 ## Quick Navigation
 
 **Just want to deploy?** → [Quick Start](quick-start.md)  
+**Deploy ArgoCD?** → [ArgoCD Deployment](argocd-deployment.md)  
+**Deploy Vault?** → [Vault Deployment](vault-deployment.md)  
 **Need troubleshooting?** → [Troubleshooting Guide](troubleshooting-guide.md)  
 **Want to reset nodes?** → [Pi Node Reset Guide](pi-node-reset.md)  
 **Setting up hardware?** → [SD Card Preparation](sd-card-preparation-and-testing.md)  
 
 ## Success Criteria
 
-✅ **Deployment Complete When:**
+✅ **Phase 1 Complete When:**
 - 3 nodes show `Ready` status
 - VIP (192.168.1.100) responds to kubectl
 - Browser access works: http://192.168.1.80:30080
-- All validation tests pass
+- All cluster validation tests pass
 
-Your cluster is production-ready and follows cloud-native best practices!
+✅ **Phase 2 In Progress:**
+- ArgoCD deployed and ready for GitOps management
+- Vault HA cluster initializing for secrets and PKI
+- Istio service mesh deployment planned
+
+Your cluster is evolving toward enterprise-grade security and automation!
