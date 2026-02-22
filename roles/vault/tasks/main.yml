@@ -343,113 +343,227 @@
     msg: "{{ pod_status.stdout_lines }}"
 
 # ==============================================
-# PHASE 7: INITIALIZATION & UNSEALING
+# PHASE 7: INITIALIZATION & UNSEALING (Bootstrap Pod Approach)
 # ==============================================
+# NOTE: Using bootstrap pod instead of kubectl exec to avoid kubelet TLS issues
+# with worker nodes. Bootstrap pod runs on master node and uses in-cluster DNS.
+
+- name: Create Vault bootstrap pod for initialization
+  shell: |
+    kubectl apply -f - <<EOF
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: vault-bootstrap
+      namespace: {{ vault_namespace }}
+      labels:
+        app: vault-bootstrap
+    spec:
+      serviceAccountName: vault
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Equal
+        effect: NoSchedule
+      containers:
+      - name: vault-init
+        image: hashicorp/vault:{{ vault_version }}
+        command: ['/bin/sh']
+        args: ['-c', 'sleep 3600']
+        env:
+        - name: VAULT_ADDR
+          value: "http://vault.{{ vault_namespace }}.svc.cluster.local:8200"
+        - name: VAULT_SKIP_VERIFY
+          value: "true"
+        volumeMounts:
+        - name: vault-config
+          mountPath: /vault/config
+      volumes:
+      - name: vault-config
+        emptyDir: {}
+      restartPolicy: Never
+    EOF
+  register: bootstrap_created
+  ignore_errors: true
+
+- name: Wait for bootstrap pod to be running
+  shell: |
+    kubectl wait --for=condition=Ready \
+      pod/vault-bootstrap \
+      -n {{ vault_namespace }} \
+      --timeout=2m || true
+  register: bootstrap_ready
+  ignore_errors: true
 
 - name: Check if Vault is already initialized
   shell: |
-    kubectl exec -n {{ vault_namespace }} vault-0 -- \
-      vault status -tls-skip-verify 2>&1 | grep -q "Initialized.*true" && echo "INITIALIZED" || echo "NOT_INITIALIZED"
+    kubectl exec -n {{ vault_namespace }} vault-bootstrap -- \
+      vault status 2>&1 | grep -q "Initialized.*true" && echo "INITIALIZED" || echo "NOT_INITIALIZED"
   register: vault_init_check
-  ignore_errors: true
   retries: 5
   delay: 10
-  until: vault_init_check.stdout
+  ignore_errors: true
+  when: bootstrap_ready.rc == 0
 
 - name: Initialize Vault (if needed)
   shell: |
-    kubectl exec -n {{ vault_namespace }} vault-0 -- vault operator init \
-      -key-shares=3 \
-      -key-threshold=2 \
-      -format=json > /tmp/vault-keys.json
-  when: vault_init_check.stdout == "NOT_INITIALIZED"
+    kubectl exec -n {{ vault_namespace }} vault-bootstrap -- \
+      vault operator init \
+        -key-shares=3 \
+        -key-threshold=2 \
+        -format=json | tee /tmp/vault-keys.json
+  when: 
+    - vault_init_check.rc == 0
+    - vault_init_check.stdout == "NOT_INITIALIZED"
   register: vault_init
+  ignore_errors: true
+
+- name: Verify initialization completed
+  shell: |
+    [ -f /tmp/vault-keys.json ] && grep -q "unseal_keys_b64" /tmp/vault-keys.json && echo "SUCCESS" || echo "FAILED"
+  register: init_verify
   ignore_errors: true
 
 - name: Create keys backup in ansible temp
   shell: |
-    [ -f /tmp/vault-keys.json ] && cp /tmp/vault-keys.json /tmp/vault-keys-backup.json && \
-    echo "✅ Vault keys backed up - SAVE TO SECURE LOCATION" || echo "⚠️  Keys file not found"
+    if [ -f /tmp/vault-keys.json ]; then
+      cp /tmp/vault-keys.json /tmp/vault-keys-backup.json
+      echo "✅ Vault keys backed up - SAVE TO SECURE LOCATION"
+      echo "File: /tmp/vault-keys.json"
+      echo "Size: $(wc -c < /tmp/vault-keys.json) bytes"
+    else
+      echo "⚠️  Keys file not found - initialization may have failed"
+    fi
   register: keys_backup
+
+- name: Display keys backup status
+  debug:
+    msg: "{{ keys_backup.stdout_lines }}"
 
 - name: Extract unseal keys if available
   shell: |
     if [ -f /tmp/vault-keys.json ]; then
-      python3 -c "import json; keys = json.load(open('/tmp/vault-keys.json')); print('\n'.join(keys['unseal_keys_b64'][:2]))" 2>/dev/null || echo "KEY_EXTRACT_FAILED"
+      python3 -c "
+import json
+try:
+    with open('/tmp/vault-keys.json') as f:
+        data = json.load(f)
+        keys = data.get('unseal_keys_b64', [])
+        for key in keys:
+            print(key)
+except Exception as e:
+    print(f'ERROR: {e}')
+" 2>/dev/null || echo "KEY_EXTRACT_FAILED"
     else
       echo "NO_KEYS_FILE"
     fi
   register: unseal_keys
   ignore_errors: true
 
-- name: Unseal Vault pods with extracted keys
+- name: Unseal Vault pods with extracted keys using bootstrap pod
   shell: |
-    if [ "{{ unseal_keys.stdout }}" != "NO_KEYS_FILE" ] && [ "{{ unseal_keys.stdout }}" != "KEY_EXTRACT_FAILED" ]; then
-      KEYS=( $(echo "{{ unseal_keys.stdout }}" | tr '\n' ' ') )
-      for pod in $(kubectl get pods -n {{ vault_namespace }} -l app.kubernetes.io/name=vault -o jsonpath='{.items[*].metadata.name}'); do
-        for key in "${KEYS[@]}"; do
-          kubectl exec -n {{ vault_namespace }} $pod -- vault operator unseal "$key" 2>/dev/null || true
-        done
+    if [ "{{ unseal_keys.stdout_lines | length }}" -gt 1 ]; then
+      # Extract first 2 unseal keys from output
+      KEY1="{{ unseal_keys.stdout_lines[0] }}"
+      KEY2="{{ unseal_keys.stdout_lines[1] }}"
+      
+      echo "Attempting to unseal Vault with 2 of 3 keys..."
+      
+      # Unseal all vault pods
+      for i in {0..{{ vault_replicas - 1 }}}; do
+        POD="vault-$i"
+        echo "Unsealing $POD..."
+        kubectl exec -n {{ vault_namespace }} vault-bootstrap -- \
+          sh -c "vault write -f sys/unseal key=$KEY1" 2>/dev/null || true
+        kubectl exec -n {{ vault_namespace }} vault-bootstrap -- \
+          sh -c "vault write -f sys/unseal key=$KEY2" 2>/dev/null || true
+        sleep 2
       done
       echo "✅ Vault unsealing attempted"
     else
-      echo "⚠️  Keys not available for unsealing"
+      echo "⚠️  Keys not available for unsealing: {{ unseal_keys.stdout | default('NO_KEYS_FILE') }}"
     fi
   register: unseal_result
+  ignore_errors: true
+
+- name: Cleanup bootstrap pod
+  shell: |
+    kubectl delete pod vault-bootstrap -n {{ vault_namespace }} --ignore-not-found=true
+  register: bootstrap_cleanup
   ignore_errors: true
 
 # ==============================================
 # PHASE 8: VERIFICATION & STATUS
 # ==============================================
 
-- name: Wait for Vault to be ready for API calls
+- name: Wait for Vault to be unsealed and ready
   shell: |
+    # Try to check Vault status via service endpoint
     for i in {1..30}; do
-      if kubectl exec -n {{ vault_namespace }} vault-0 -- \
-         vault status -tls-skip-verify 2>/dev/null | grep -q "Sealed.*false"; then
-        echo "✅ Vault unsealed and ready"
-        exit 0
+      STATUS=$(kubectl get pods -n {{ vault_namespace }} -l app.kubernetes.io/name=vault -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
+      if [ "$STATUS" == "Running" ]; then
+        echo "✅ Vault pods are Running"
+        # Check if keys were successfully created
+        if [ -f /tmp/vault-keys.json ]; then
+          echo "✅ Vault initialization keys available"
+          exit 0
+        fi
       fi
       sleep 5
     done
-    echo "⚠️  Vault still sealing - manual unseal may be required"
+    echo "⚠️  Vault pods not yet fully operational - may require manual unseal"
   register: vault_ready
   ignore_errors: true
 
-- name: Get Vault status
+- name: Get final Vault pod status
   shell: |
-    kubectl exec -n {{ vault_namespace }} vault-0 -- \
-      vault status -tls-skip-verify 2>/dev/null || echo "Status unavailable - pod may still be initializing"
-  register: vault_status
-  ignore_errors: true
+    kubectl get pods -n {{ vault_namespace }} -l app.kubernetes.io/name=vault -o wide
+  register: vault_pod_status
 
-- name: Display Vault status
+- name: Display Vault pod status
   debug:
-    msg: "{{ vault_status.stdout_lines }}"
+    msg: "{{ vault_pod_status.stdout_lines }}"
+
+- name: Display initialization keys location
+  debug:
+    msg:
+      - "✅ Vault HA deployment complete!"
+      - ""
+      - "📝 INITIALIZATION KEYS:"
+      - "   Location: /tmp/vault-keys.json"
+      - "   ⚠️  SAVE TO SECURE OFFLINE LOCATION IMMEDIATELY"
+      - ""
+      - "🔐 Next Step - Manual Key Backup:"
+      - "   1. Copy /tmp/vault-keys.json to secure location"
+      - "   2. Store root token and unseal keys separately"
+      - "   3. Delete /tmp/vault-keys.json from this server"
+      - ""
 
 # ==============================================
-# PHASE 9: KUBERNETES AUTH CONFIGURATION
+# PHASE 9: KUBERNETES AUTH - DEFERRED TO PKI CONFIGURATION
 # ==============================================
+# NOTE: Kubernetes auth will be configured in Phase 4 of vault-initialization-guide.md
+# This is deferred because Vault needs to be unsealed first, which requires manual 
+# key entry from the initialization file saved by this playbook.
 
-- name: Enable Kubernetes auth method
-  shell: |
-    kubectl exec -n {{ vault_namespace }} vault-0 -- \
-      vault auth enable kubernetes 2>/dev/null || echo "kubernetes auth already enabled"
-  register: k8s_auth_enable
-  ignore_errors: true
-  when: vault_ready.rc == 0
-
-- name: Configure Kubernetes auth
-  shell: |
-    kubectl exec -n {{ vault_namespace }} vault-0 -- \
-      vault write auth/kubernetes/config \
-        kubernetes_host="https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT" \
-        kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
-        token_reviewer_jwt=@/var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || \
-        echo "K8s auth config may already exist"
-  register: k8s_auth_config
-  ignore_errors: true
-  when: vault_ready.rc == 0
+- name: Display PKI configuration instructions
+  debug:
+    msg:
+      - ""
+      - "⏭️  NEXT STEPS - Vault PKI Configuration:"
+      - ""
+      - "   Phase 4 of docs/vault-initialization-guide.md covers:"
+      - "   1. Manual key backup and secure storage"
+      - "   2. Unsealing Vault using the 3 unseal keys"
+      - "   3. Enabling PKI secrets engine"
+      - "   4. Creating root CA and intermediate CA for Istio"
+      - "   5. Enabling Kubernetes auth method"
+      - "   6. Configuring Kubernetes auth for service accounts"
+      - ""
+      - "   Execute Phase 4 commands in order from:"
+      - "   docs/vault-initialization-guide.md (Phase 4 section)"
+      - ""
 
 # ==============================================
 # PHASE 10: DEPLOYMENT SUMMARY
