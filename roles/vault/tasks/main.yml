@@ -50,6 +50,21 @@
   register: ns_verify
 
 # ==============================================
+# PHASE 1.5: ISTIO SIDECAR INJECTION EXCLUSION
+# ==============================================
+
+- name: Exclude vault namespace from Istio sidecar injection
+  shell: |
+    # Check if istio sidecar injector webhook exists
+    if kubectl get mutatingwebhookconfigurations istio-sidecar-injector 2>/dev/null; then
+      # Add vault to the exclusion list
+      kubectl patch mutatingwebhookconfigurations istio-sidecar-injector \
+        --type='json' \
+        -p='[{"op": "add", "path": "/webhooks/0/namespaceSelector/matchExpressions/0/values/-", "value": "vault"}]' 2>/dev/null || true
+    fi
+  ignore_errors: true
+
+# ==============================================
 # PHASE 2: STORAGE PREPARATION
 # ==============================================
 
@@ -81,6 +96,107 @@
   shell: |
     kubectl get storageclass {{ vault_storage_class }}
   register: storage_verify
+
+# ==============================================
+# PHASE 2.5: CREATE PERSISTENT VOLUMES ON WORKERS
+# ==============================================
+
+- name: Create PersistentVolumes on worker nodes for Vault storage
+  shell: |
+    kubectl apply -f - <<'EOF'
+    ---
+    apiVersion: v1
+    kind: PersistentVolume
+    metadata:
+      name: local-pv-vault-1
+    spec:
+      capacity:
+        storage: 10Gi
+      volumeMode: Filesystem
+      accessModes:
+        - ReadWriteOnce
+      persistentVolumeReclaimPolicy: Delete
+      storageClassName: {{ vault_storage_class }}
+      local:
+        path: /mnt/vault-data
+      nodeAffinity:
+        required:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                    - k8s-worker-1
+    ---
+    apiVersion: v1
+    kind: PersistentVolume
+    metadata:
+      name: local-pv-vault-2
+    spec:
+      capacity:
+        storage: 10Gi
+      volumeMode: Filesystem
+      accessModes:
+        - ReadWriteOnce
+      persistentVolumeReclaimPolicy: Delete
+      storageClassName: {{ vault_storage_class }}
+      local:
+        path: /mnt/vault-data
+      nodeAffinity:
+        required:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                    - k8s-worker-2
+    ---
+    apiVersion: v1
+    kind: PersistentVolume
+    metadata:
+      name: local-pv-vault-3
+    spec:
+      capacity:
+        storage: 10Gi
+      volumeMode: Filesystem
+      accessModes:
+        - ReadWriteOnce
+      persistentVolumeReclaimPolicy: Delete
+      storageClassName: {{ vault_storage_class }}
+      local:
+        path: /mnt/vault-data
+      nodeAffinity:
+        required:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values:
+                    - k8s-worker-3
+    EOF
+  register: pv_creation
+  retries: 2
+  delay: 5
+  until: pv_creation.rc == 0
+
+- name: Verify PersistentVolumes created
+  shell: |
+    kubectl get pv | grep local-pv-vault
+  register: pv_verify
+
+- name: Display PV status
+  debug:
+    msg: "{{ pv_verify.stdout_lines }}"
+
+- name: Prepare vault data directories on worker nodes
+  shell: |
+    for node in k8s-worker-1 k8s-worker-2 k8s-worker-3; do
+      ssh -i ~/.ssh/proxmox -o IdentitiesOnly=yes -o StrictHostKeyChecking=no "ubuntu@${node}" \
+        "sudo mkdir -p /mnt/vault-data && sudo chmod 777 /mnt/vault-data" 2>/dev/null || true
+    done
+    echo "✅ Vault data directories prepared on all worker nodes"
+  register: data_dir_prep
+  ignore_errors: true
 
 # ==============================================
 # PHASE 3: HELM REPOSITORY SETUP
