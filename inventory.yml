@@ -29,20 +29,28 @@ all:
             k8s-node-2:
             k8s-node-3:
     
-    # Worker Nodes (currently none as all Raspberry Pi nodes are control plane)
+    # Worker Nodes (Proxmox x86 VMs joining the control plane)
     k8s_workers:
+      hosts:
+        k8s-worker-1:
+          ansible_host: 192.168.1.83
+          ansible_user: k8s_83
+          node_role: worker
+        k8s-worker-2:
+          ansible_host: 192.168.1.84
+          ansible_user: k8s_84
+          node_role: worker
+        k8s-worker-3:
+          ansible_host: 192.168.1.85
+          ansible_user: k8s_85
+          node_role: worker
       children:
-        # Raspberry Pi Worker Nodes
-        k8s_workers_pi:
-          hosts: {}
-        # Lenovo M920Q Worker Nodes (for future use)
+        # Proxmox x86 Worker Nodes
         k8s_workers_x86:
-          hosts: {}
-          # Add Lenovo nodes here when available
-          # lenovo-worker-1:
-          #   ansible_host: 192.168.1.90
-          #   ansible_user: ubuntu
-          #   node_role: worker
+          hosts:
+            k8s-worker-1:
+            k8s-worker-2:
+            k8s-worker-3:
     
     # Group for all Kubernetes nodes
     k8s_nodes:

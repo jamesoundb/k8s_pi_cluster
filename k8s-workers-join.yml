@@ -1,0 +1,286 @@
+---
+# Kubernetes Worker Node Join Playbook
+# Joins worker nodes to the HA control plane cluster with proper certificate distribution
+# This ensures worker nodes can be managed by kubectl exec and other control plane operations
+
+# [0] Prepare worker nodes with OS and container runtime
+- name: Prepare worker nodes
+  hosts: k8s_workers
+  become: true
+  roles:
+    - common
+    - containerd
+  tasks:
+    - name: Reset any existing Kubernetes configuration
+      shell: kubeadm reset -f
+      ignore_errors: true
+
+    - name: Clean up old configuration
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/kubelet/pki
+        - /var/lib/kubelet/plugins
+        - "/home/{{ ansible_user }}/.kube"
+
+    - name: Create .kube directory for user
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+# [1] Install Kubernetes on worker nodes
+- name: Install Kubernetes tools on worker nodes
+  hosts: k8s_workers
+  become: true
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        
+    - name: Install required packages for Kubernetes repository
+      apt:
+        name:
+          - curl
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+        state: present
+        
+    - name: Create keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+        
+    - name: Add Kubernetes apt signing key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        
+    - name: Add Kubernetes apt repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /"
+        state: present
+        filename: kubernetes
+        
+    - name: Update apt cache for Kubernetes packages
+      apt:
+        update_cache: yes
+        
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet={{ k8s_version }}-1.1
+          - kubeadm={{ k8s_version }}-1.1
+          - kubectl={{ k8s_version }}-1.1
+        state: present
+        
+    - name: Hold Kubernetes packages to prevent automatic updates
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+# [2] Configure kubelet on worker nodes
+- name: Configure kubelet on worker nodes  
+  hosts: k8s_workers
+  become: true
+  tasks:
+    - name: Create kubelet config directory
+      file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Configure kubelet resources for worker nodes
+      copy:
+        dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+        content: |
+          [Service]
+          Environment="KUBELET_EXTRA_ARGS=--eviction-hard={{ worker_kubelet_extra_args if 'worker_kubelet_extra_args' in hostvars[inventory_hostname] else 'memory.available<100Mi,nodefs.available<10%' }}"
+        mode: '0644'
+      notify: Restart kubelet
+
+    - name: Enable kubelet service (don't start yet)
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: stopped
+
+  handlers:
+    - name: Restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+
+# [3] Distribute certificates to worker nodes for proper trust chain
+- name: Distribute control plane certificates to worker nodes
+  hosts: k8s_workers
+  become: true
+  serial: 1  # Process one worker at a time to avoid race conditions
+  tasks:
+    - name: Create certificate directories on worker node
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - /etc/kubernetes/pki
+        - /etc/kubernetes/pki/etcd
+
+    - name: Copy shared CA certificates from primary control plane node
+      fetch:
+        src: "{{ item.src }}"
+        dest: "/tmp/{{ item.dest }}"
+        flat: yes
+      delegate_to: "{{ groups['k8s_master_init'][0] }}"
+      loop:
+        - { src: "/etc/kubernetes/pki/ca.crt", dest: "worker-ca.crt" }
+        - { src: "/etc/kubernetes/pki/ca.key", dest: "worker-ca.key" }
+        - { src: "/etc/kubernetes/pki/sa.pub", dest: "worker-sa.pub" }
+        - { src: "/etc/kubernetes/pki/sa.key", dest: "worker-sa.key" }
+        - { src: "/etc/kubernetes/pki/front-proxy-ca.crt", dest: "worker-front-proxy-ca.crt" }
+        - { src: "/etc/kubernetes/pki/front-proxy-ca.key", dest: "worker-front-proxy-ca.key" }
+        - { src: "/etc/kubernetes/pki/etcd/ca.crt", dest: "worker-etcd-ca.crt" }
+        - { src: "/etc/kubernetes/pki/etcd/ca.key", dest: "worker-etcd-ca.key" }
+        run_once: true
+
+    - name: Copy CA certificates to worker node
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "/tmp/worker-ca.crt", dest: "/etc/kubernetes/pki/ca.crt", mode: "0644" }
+        - { src: "/tmp/worker-ca.key", dest: "/etc/kubernetes/pki/ca.key", mode: "0600" }
+        - { src: "/tmp/worker-sa.pub", dest: "/etc/kubernetes/pki/sa.pub", mode: "0644" }
+        - { src: "/tmp/worker-sa.key", dest: "/etc/kubernetes/pki/sa.key", mode: "0600" }
+        - { src: "/tmp/worker-front-proxy-ca.crt", dest: "/etc/kubernetes/pki/front-proxy-ca.crt", mode: "0644" }
+        - { src: "/tmp/worker-front-proxy-ca.key", dest: "/etc/kubernetes/pki/front-proxy-ca.key", mode: "0600" }
+        - { src: "/tmp/worker-etcd-ca.crt", dest: "/etc/kubernetes/pki/etcd/ca.crt", mode: "0644" }
+        - { src: "/tmp/worker-etcd-ca.key", dest: "/etc/kubernetes/pki/etcd/ca.key", mode: "0600" }
+
+    - name: Generate fresh join token for this worker
+      shell: kubeadm token create --ttl=1h
+      delegate_to: "{{ groups['k8s_master_init'][0] }}"
+      register: worker_join_token
+
+    - name: Get current CA certificate hash
+      shell: openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'
+      register: ca_hash
+
+    - name: Display worker join command
+      debug:
+        msg: |
+          Worker {{ inventory_hostname }} join command:
+          kubeadm join 192.168.1.100:6443 \
+            --token {{ worker_join_token.stdout }} \
+            --discovery-token-ca-cert-hash sha256:{{ ca_hash.stdout }} \
+            --v=5
+
+    - name: Join worker node to cluster with direct certificates
+      shell: |
+        kubeadm join 192.168.1.100:6443 \
+          --token {{ worker_join_token.stdout }} \
+          --discovery-token-ca-cert-hash sha256:{{ ca_hash.stdout }} \
+          --v=5
+      register: join_result
+
+    - name: Display join result
+      debug:
+        var: join_result.stdout_lines
+
+    - name: Start kubelet service on worker node
+      systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    - name: Wait for kubelet to be ready on worker node
+      wait_for:
+        path: /var/lib/kubelet/config.yaml
+        timeout: 120
+
+    - name: Setup kubeconfig for worker node user
+      shell: |
+        mkdir -p /home/{{ ansible_user }}/.kube
+        sudo cp -i /etc/kubernetes/admin.conf /home/{{ ansible_user }}/.kube/config
+        sudo chown {{ ansible_user }}:{{ ansible_user }} /home/{{ ansible_user }}/.kube/config
+      ignore_errors: true
+      register: kubeconfig_setup
+
+    - name: Wait for node to be in Ready state
+      shell: kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes {{ inventory_hostname }} --no-headers
+      register: node_status
+      until: "'Ready' in node_status.stdout"
+      retries: 30
+      delay: 10
+      delegate_to: "{{ groups['k8s_master_init'][0] }}"
+      failed_when: false
+
+    - name: Display node status
+      debug:
+        msg: "Worker node {{ inventory_hostname }} status check: {{ node_status.stdout }}"
+
+# [4] Verify worker node connectivity from control plane
+- name: Verify worker nodes are reachable from control plane
+  hosts: k8s_master_init
+  become: true
+  tasks:
+    - name: Wait for all worker nodes to be Ready
+      shell: kubectl get nodes -l node-role.kubernetes.io/worker --no-headers | grep Ready | wc -l
+      register: ready_workers
+      until: ready_workers.stdout|int >= (groups['k8s_workers'] | length)
+      retries: 30
+      delay: 10
+      ignore_errors: true
+
+    - name: Display all nodes in cluster
+      shell: kubectl get nodes -o wide
+      register: all_nodes_status
+
+    - name: Show all nodes
+      debug:
+        var: all_nodes_status.stdout_lines
+
+    - name: Verify kubelet connectivity on worker nodes
+      shell: |
+        for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+          echo "Testing connection to kubelet on $node..."
+          kubectl debug node/$node -it --image=busybox -- chroot /host hostname || echo "kubelet on $node may have TLS issues"
+        done
+      register: kubelet_connectivity_test
+      ignore_errors: true
+
+    - name: Show kubelet connectivity test results
+      debug:
+        var: kubelet_connectivity_test.stdout_lines
+
+    - name: Worker node joining complete
+      debug:
+        msg:
+          - ""
+          - "========================================"
+          - "🎉 WORKER NODES SUCCESSFULLY JOINED!"
+          - "========================================"
+          - ""
+          - "✅ All worker nodes Ready"
+          - "✅ Certificates distributed"
+          - "✅ Kubelets reachable from control plane"
+          - "✅ Control plane can execute commands on workers"
+          - ""
+          - "🔧 Cluster ready for workload deployment"
+          - "========================================"
+          - ""

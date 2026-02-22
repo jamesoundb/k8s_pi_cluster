@@ -130,6 +130,25 @@
           kind: ClusterConfiguration
           kubernetesVersion: v{{ k8s_version }}
           controlPlaneEndpoint: {{ ansible_host }}:6443
+          apiServer:
+            certSANs:
+            - "192.168.1.100"  # VIP (future HA)
+            - "192.168.1.80"
+            - "192.168.1.81"
+            - "192.168.1.82"
+            - "192.168.1.83"   # worker nodes
+            - "192.168.1.84"
+            - "192.168.1.85"
+            - "k8s-node-1"
+            - "k8s-node-2"
+            - "k8s-node-3"
+            - "k8s-worker-1"   # worker hostnames
+            - "k8s-worker-2"
+            - "k8s-worker-3"
+            - "kubernetes"
+            - "kubernetes.default"
+            - "kubernetes.default.svc"
+            - "kubernetes.default.svc.cluster.local"
           networking:
             podSubnet: 10.244.0.0/16
             serviceSubnet: 10.245.0.0/16
